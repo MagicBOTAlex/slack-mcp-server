@@ -57,10 +57,14 @@ type Message struct {
 	Time          string `json:"time"`
 	Permalink     string `json:"permalink,omitempty"`
 	Reactions     string `json:"reactions,omitempty"`
+	ReactionUsers string `json:"reactionUsers,omitempty"`
 	BotName       string `json:"botName,omitempty"`
 	FileCount     int    `json:"fileCount,omitempty"`
 	AttachmentIDs string `json:"attachmentIDs,omitempty"`
 	HasMedia      bool   `json:"hasMedia,omitempty"`
+	ReplyCount    int    `json:"replyCount,omitempty"`
+	ReplyUsers    int    `json:"replyUsersCount,omitempty"`
+	LatestReply   string `json:"latestReply,omitempty"`
 	Cursor        string `json:"cursor"`
 }
 
@@ -71,13 +75,16 @@ type User struct {
 }
 
 type UserSearchResult struct {
-	UserID      string `csv:"UserID"`
-	UserName    string `csv:"UserName"`
-	RealName    string `csv:"RealName"`
-	DisplayName string `csv:"DisplayName"`
-	Email       string `csv:"Email"`
-	Title       string `csv:"Title"`
-	DMChannelID string `csv:"DMChannelID"`
+	UserID         string `csv:"UserID"`
+	UserName       string `csv:"UserName"`
+	RealName       string `csv:"RealName"`
+	DisplayName    string `csv:"DisplayName"`
+	Email          string `csv:"Email"`
+	Title          string `csv:"Title"`
+	TimeZone       string `csv:"TimeZone"`
+	TimeZoneLabel  string `csv:"TimeZoneLabel"`
+	TimeZoneOffset int    `csv:"TimeZoneOffset"`
+	DMChannelID    string `csv:"DMChannelID"`
 }
 
 type conversationParams struct {
@@ -433,13 +440,16 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 		}
 
 		results = append(results, UserSearchResult{
-			UserID:      user.ID,
-			UserName:    user.Name,
-			RealName:    user.RealName,
-			DisplayName: user.Profile.DisplayName,
-			Email:       user.Profile.Email,
-			Title:       user.Profile.Title,
-			DMChannelID: dmChannelID,
+			UserID:         user.ID,
+			UserName:       user.Name,
+			RealName:       user.RealName,
+			DisplayName:    user.Profile.DisplayName,
+			Email:          user.Profile.Email,
+			Title:          user.Profile.Title,
+			TimeZone:       user.TZ,
+			TimeZoneLabel:  user.TZLabel,
+			TimeZoneOffset: user.TZOffset,
+			DMChannelID:    dmChannelID,
 		})
 	}
 
@@ -1757,6 +1767,7 @@ func (ch *ConversationsHandler) resolveChannelID(ctx context.Context, channel st
 
 func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, slackMessages []slack.Message, channel string, includeActivity bool) []Message {
 	resolver := ch.newUserResolver(ctx)
+	baseURL := ch.workspaceBaseURL()
 	var messages []Message
 	warn := false
 
@@ -1795,6 +1806,7 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, 
 			reactionParts = append(reactionParts, fmt.Sprintf("%s:%d", r.Name, r.Count))
 		}
 		reactionsString := strings.Join(reactionParts, "|")
+		reactionUsersString := formatReactionUsers(msg.Reactions, resolver)
 
 		botName := ""
 		if msg.BotProfile != nil && msg.BotProfile.Name != "" {
@@ -1814,6 +1826,13 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, 
 		}
 		attachmentIDsStr := strings.Join(attachmentIDs, ", ")
 
+		threadTs := msg.ThreadTimestamp
+		if threadTs == "" && msg.ReplyCount > 0 {
+			// conversations.history does not set thread_ts on a parent message.
+			// Surface the parent timestamp so the caller can fetch its replies.
+			threadTs = msg.Timestamp
+		}
+
 		messages = append(messages, Message{
 			MsgID:         msg.Timestamp,
 			UserID:        msg.User,
@@ -1821,13 +1840,18 @@ func (ch *ConversationsHandler) convertMessagesFromHistory(ctx context.Context, 
 			RealName:      realName,
 			Text:          text.ProcessText(msgText),
 			Channel:       channel,
-			ThreadTs:      msg.ThreadTimestamp,
+			ThreadTs:      threadTs,
 			Time:          timestamp,
+			Permalink:     slackPermalink(baseURL, channel, msg.Timestamp, threadTs),
 			Reactions:     reactionsString,
+			ReactionUsers: reactionUsersString,
 			BotName:       botName,
 			FileCount:     fileCount,
 			AttachmentIDs: attachmentIDsStr,
 			HasMedia:      hasMedia,
+			ReplyCount:    msg.ReplyCount,
+			ReplyUsers:    len(msg.ReplyUsers),
+			LatestReply:   msg.LatestReply,
 		})
 	}
 
@@ -2522,6 +2546,49 @@ func (r *userResolver) resolve(userID string) (userName, realName string, ok boo
 
 func getBotInfo(botID string) (userName, realName string, ok bool) {
 	return botID, botID, true
+}
+
+// workspaceBaseURL returns the team URL used to build message permalinks.
+// AuthTest is cached by the Slack client, so this does not add a request per
+// message.
+func (ch *ConversationsHandler) workspaceBaseURL() string {
+	ar, err := ch.apiProvider.Slack().AuthTest()
+	if err != nil || ar == nil || ar.URL == "" {
+		return ""
+	}
+	return strings.TrimSuffix(ar.URL, "/")
+}
+
+func slackPermalink(baseURL, channel, ts, threadTs string) string {
+	if baseURL == "" || channel == "" || ts == "" {
+		return ""
+	}
+	link := fmt.Sprintf("%s/archives/%s/p%s", baseURL, channel, strings.ReplaceAll(ts, ".", ""))
+	if threadTs != "" && threadTs != ts {
+		link += "?thread_ts=" + url.QueryEscape(threadTs) + "&cid=" + url.QueryEscape(channel)
+	}
+	return link
+}
+
+// formatReactionUsers returns "reaction:user1,user2|..." so callers can see
+// who reacted, not just the counts.
+func formatReactionUsers(reactions []slack.ItemReaction, resolver *userResolver) string {
+	var parts []string
+	for _, r := range reactions {
+		if len(r.Users) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(r.Users))
+		for _, uid := range r.Users {
+			name, _, _ := resolver.resolve(uid)
+			if name == "" {
+				name = uid
+			}
+			names = append(names, name)
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s", r.Name, strings.Join(names, ",")))
+	}
+	return strings.Join(parts, "|")
 }
 
 func limitByNumeric(limit string, defaultLimit int) (int, error) {

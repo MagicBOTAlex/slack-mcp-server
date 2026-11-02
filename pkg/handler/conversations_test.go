@@ -796,3 +796,51 @@ func TestUnitThreadMessageMatches(t *testing.T) {
 		})
 	}
 }
+
+func TestUnitSlackPermalink(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseURL  string
+		channel  string
+		ts       string
+		threadTs string
+		want     string
+	}{
+		{
+			name:    "top level message",
+			baseURL: "https://workspace.slack.com",
+			channel: "C123",
+			ts:      "1793331829.099699",
+			want:    "https://workspace.slack.com/archives/C123/p1793331829099699",
+		},
+		{
+			name:     "thread reply",
+			baseURL:  "https://workspace.slack.com",
+			channel:  "C123",
+			ts:       "1793333904.614359",
+			threadTs: "1793332203.161879",
+			want:     "https://workspace.slack.com/archives/C123/p1793333904614359?thread_ts=1793332203.161879&cid=C123",
+		},
+		{
+			name:     "thread parent",
+			baseURL:  "https://workspace.slack.com",
+			channel:  "C123",
+			ts:       "1793332203.161879",
+			threadTs: "1793332203.161879",
+			want:     "https://workspace.slack.com/archives/C123/p1793332203161879",
+		},
+		{
+			name:    "missing workspace",
+			channel: "C123",
+			ts:      "1793331829.099699",
+			want:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := slackPermalink(tt.baseURL, tt.channel, tt.ts, tt.threadTs); got != tt.want {
+				t.Fatalf("slackPermalink() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

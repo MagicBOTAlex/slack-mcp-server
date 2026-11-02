@@ -308,7 +308,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 
 	if shouldAddTool(ToolUsersSearch, enabledTools, "") {
 		s.AddTool(mcp.NewTool(ToolUsersSearch,
-			mcp.WithDescription("Search for users by name, email, display name, or Slack user ID. If a Slack user ID is provided (e.g. U07VCEPP4N5), the user is looked up directly. Returns user details and DM channel ID if available."),
+			mcp.WithDescription("Search for users by name, email, display name, or Slack user ID. If a Slack user ID is provided (e.g. U07VCEPP4N5), the user is looked up directly. Returns user details including timezone, profile fields, and DM channel ID if available."),
 			mcp.WithTitleAnnotation("Search Users"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("query",

@@ -50,6 +50,8 @@ Get a thread of messages posted to a conversation by channelID and `thread_ts`, 
   - `cursor` (string, optional): Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request.
   - `limit` (string, default: "1d"): Limit of messages to fetch in format of maximum ranges of time (e.g. `30min` - 30 minutes, `2h` - 2 hours, `1d` - 1 day, `30d` - 30 days, `90d` - 90 days) or number of messages (e.g. `50`). Must be empty when 'cursor' is provided. Thread reads default to a numeric page when no limit is supplied.
 
+Message rows from `conversations_history` and `conversations_replies` include `ReplyCount`, `ReplyUsers`, `LatestReply`, `Permalink`, and `ReactionUsers` (who reacted) in addition to the message text. A parent message with replies has `ReplyCount > 0` and its `ThreadTs` set to its own timestamp, so it can be passed directly to `conversations_replies`.
+
 ### 3. conversations_add_message
 Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts.
 
@@ -124,6 +126,9 @@ Search for users by name, email, or display name. Returns user details and DM ch
   - `DisplayName`: User's display name
   - `Email`: User's email address
   - `Title`: User's job title
+  - `TimeZone`: IANA timezone (e.g., `Europe/Amsterdam`)
+  - `TimeZoneLabel`: Human-readable timezone label (e.g., `Central European Time`)
+  - `TimeZoneOffset`: Current UTC offset in seconds
   - `DMChannelID`: DM channel ID if available in cache (for quick messaging)
 
 ### 9. usergroups_list:
