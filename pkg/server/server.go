@@ -52,6 +52,7 @@ const (
 	ToolConversationsDeleteMessage  = "conversations_delete_message"
 	ToolFilesList                   = "files_list"
 	ToolFilesUpload                 = "files_upload"
+	ToolFilesDelete                 = "files_delete"
 	ToolCanvasRead                  = "canvas_read"
 	ToolListsItemsList              = "lists_items_list"
 	ToolSavedList                   = "saved_list"
@@ -87,6 +88,7 @@ var ValidToolNames = []string{
 	ToolConversationsDeleteMessage,
 	ToolFilesList,
 	ToolFilesUpload,
+	ToolFilesDelete,
 	ToolCanvasRead,
 	ToolListsItemsList,
 	ToolSavedList,
@@ -371,6 +373,18 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		), conversationsHandler.FilesUploadHandler)
 	}
 
+	if shouldAddTool(ToolFilesDelete, enabledTools, "SLACK_MCP_DELETE_FILE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolFilesDelete,
+			mcp.WithDescription("Delete a Slack file by file ID or file URL. Requires SLACK_MCP_DELETE_FILE_TOOL."),
+			mcp.WithTitleAnnotation("Delete File"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("file_id",
+				mcp.Required(),
+				mcp.Description("File ID (F...) or a Slack file URL containing it."),
+			),
+		), conversationsHandler.FilesDeleteHandler)
+	}
+
 	if shouldAddTool(ToolCanvasRead, enabledTools, "") {
 		s.AddTool(mcp.NewTool(ToolCanvasRead,
 			mcp.WithDescription("Read a Slack canvas by file ID or canvas URL. Returns metadata and the canvas content converted to plain text."),
@@ -467,12 +481,12 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 
 	if shouldAddTool(ToolAttachmentGetData, enabledTools, "SLACK_MCP_ATTACHMENT_TOOL") {
 		s.AddTool(mcp.NewTool(ToolAttachmentGetData,
-			mcp.WithDescription("Download an attachment's content by file ID. Returns file metadata and content (text files as-is, binary files as base64). Maximum file size is 5MB."),
+			mcp.WithDescription("Download an attachment's content by file ID or Slack file URL. Images are returned as native image content, text-like files as text, and other binaries as base64. Maximum file size is 5MB."),
 			mcp.WithTitleAnnotation("Get Attachment Data"),
 			mcp.WithReadOnlyHintAnnotation(true),
 			mcp.WithString("file_id",
 				mcp.Required(),
-				mcp.Description("The ID of the attachment to download, in format Fxxxxxxxxxx. Attachment IDs (with filenames) can be found in the AttachmentIDs field of message metadata when FileCount > 0."),
+				mcp.Description("File ID (F...) or a Slack file URL. File IDs can be found in the AttachmentIDs field of message metadata when FileCount > 0, or from files_list."),
 			),
 		), conversationsHandler.FilesGetHandler)
 	}

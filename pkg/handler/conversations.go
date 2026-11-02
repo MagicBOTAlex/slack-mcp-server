@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -810,6 +811,20 @@ func (ch *ConversationsHandler) FilesUploadHandler(ctx context.Context, request 
 	return mcp.NewToolResultText(fmt.Sprintf("Uploaded %s (%s, %d bytes) to channel %s", file.Title, file.ID, len(data), params.channel)), nil
 }
 
+func (ch *ConversationsHandler) FilesDeleteHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if _, err := requiredWriteToolConfig("SLACK_MCP_DELETE_FILE_TOOL", "files_delete"); err != nil {
+		return nil, err
+	}
+	fileID := extractSlackFileID(request.GetString("file_id", ""))
+	if fileID == "" {
+		return nil, errors.New("file_id is required")
+	}
+	if err := ch.apiProvider.Slack().DeleteFileContext(ctx, fileID); err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("File %s deleted", fileID)), nil
+}
+
 func (ch *ConversationsHandler) FilesListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	params, err := ch.parseParamsToolFilesList(ctx, request)
 	if err != nil {
@@ -970,7 +985,7 @@ func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp
 	encoding := "none"
 	var contentStr string
 
-	if isTextMimetype(fileInfo.Mimetype) {
+	if isTextMimetype(fileInfo.Mimetype) || isTextFile(fileInfo.Name) {
 		contentStr = string(content)
 	} else {
 		contentStr = base64.StdEncoding.EncodeToString(content)
@@ -1004,6 +1019,20 @@ func isTextMimetype(mimetype string) bool {
 		"application/x-sh":       true,
 	}
 	return textMimetypes[mimetype]
+}
+
+// isTextFile catches text-like files that Slack reports as
+// application/octet-stream (for example .html uploads) by extension.
+func isTextFile(name string) bool {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".ndjson",
+		".yaml", ".yml", ".xml", ".html", ".htm", ".css", ".scss", ".js", ".jsx",
+		".ts", ".tsx", ".py", ".go", ".rs", ".java", ".kt", ".sql", ".sh", ".bash",
+		".zsh", ".fish", ".toml", ".ini", ".conf", ".cfg", ".log", ".diff", ".patch",
+		".svg":
+		return true
+	}
+	return false
 }
 
 func escapeJSON(s string) string {
@@ -2721,7 +2750,7 @@ func (ch *ConversationsHandler) parseParamsToolFilesGet(request mcp.CallToolRequ
 		return nil, errors.New("SLACK_MCP_ATTACHMENT_TOOL must be set to 'true', '1', or 'yes' to enable")
 	}
 
-	fileID := request.GetString("file_id", "")
+	fileID := extractSlackFileID(request.GetString("file_id", ""))
 	if fileID == "" {
 		return nil, errors.New("file_id is required")
 	}

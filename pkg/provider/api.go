@@ -235,6 +235,7 @@ type SlackAPI interface {
 	GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error
 	GetFilesContext(ctx context.Context, params slack.GetFilesParameters) ([]slack.File, *slack.Paging, error)
 	UploadFileContext(ctx context.Context, params slack.UploadFileParameters) (*slack.FileSummary, error)
+	DeleteFileContext(ctx context.Context, fileID string) error
 
 	// Users
 	GetUserPresenceContext(ctx context.Context, user string) (*slack.UserPresence, error)
@@ -580,6 +581,10 @@ func (c *MCPSlackClient) GetFilesContext(ctx context.Context, params slack.GetFi
 
 func (c *MCPSlackClient) UploadFileContext(ctx context.Context, params slack.UploadFileParameters) (*slack.FileSummary, error) {
 	return c.slackClient.UploadFileContext(ctx, params)
+}
+
+func (c *MCPSlackClient) DeleteFileContext(ctx context.Context, fileID string) error {
+	return c.slackClient.DeleteFileContext(ctx, fileID)
 }
 
 func (c *MCPSlackClient) GetUserPresenceContext(ctx context.Context, user string) (*slack.UserPresence, error) {
