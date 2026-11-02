@@ -17,6 +17,7 @@ import (
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/responses"
+	"github.com/slack-go/slack"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -533,6 +534,9 @@ func TestUnitLimitByExpression_Valid(t *testing.T) {
 		{"2 days", "2d", 86400, 172800},
 		{"1 week", "1w", 6 * 86400, 7 * 86400},
 		{"2 weeks", "2w", 13 * 86400, 14 * 86400},
+		{"90 seconds", "90s", 89, 91},
+		{"30 minutes", "30min", 30*60 - 1, 30*60 + 1},
+		{"2 hours", "2h", 2*3600 - 1, 2*3600 + 1},
 		{"1 month", "1m", oneMonthSpan - tolerance, oneMonthSpan + tolerance},
 		{"2 months", "2m", twoMonthSpan - tolerance, twoMonthSpan + tolerance},
 	}
@@ -573,12 +577,14 @@ func TestUnitLimitByExpression_Valid(t *testing.T) {
 
 func TestUnitLimitByExpression_Invalid(t *testing.T) {
 	invalid := []string{
-		"d",   // too short
-		"0d",  // zero
-		"-1d", // negative
-		"1x",  // bad suffix
-		"1",   // missing suffix
-		"01",  // no suffix + zero value
+		"d",       // too short
+		"0d",      // zero
+		"-1d",     // negative
+		"1x",      // bad suffix
+		"1",       // missing suffix
+		"01",      // no suffix + zero value
+		"0h",      // zero hours
+		"1min30s", // mixed duration
 	}
 
 	for _, input := range invalid {
@@ -649,6 +655,143 @@ func TestUnitIsSlackUserIDPrefix(t *testing.T) {
 			got := isSlackUserIDPrefix(tt.s)
 			if got != tt.want {
 				t.Errorf("isSlackUserIDPrefix(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnitNormalizeSlackTS(t *testing.T) {
+	tests := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"1793574416.614509", "1793574416.614509", true},
+		{"p1793574490429049", "1793574490.429049", true},
+		{"1793574490429049", "1793574490.429049", true},
+		{"  p1793574490429049  ", "1793574490.429049", true},
+		{"", "", false},
+		{"123", "", false},
+		{"not-a-ts", "", false},
+		{"123.456.789", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, ok := normalizeSlackTS(tt.in)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("normalizeSlackTS(%q) = (%q, %v), want (%q, %v)", tt.in, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestUnitParseSlackMessageURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want *slackMessageRef
+		ok   bool
+	}{
+		{
+			name: "thread reply permalink",
+			in:   "https://eqcompany.slack.com/archives/C0C1WLW7LM8/p1793333904614359?thread_ts=1793332203.161879&cid=C0C1WLW7LM8",
+			want: &slackMessageRef{ChannelID: "C0C1WLW7LM8", Timestamp: "1793333904.614359", ThreadTS: "1793332203.161879"},
+			ok:   true,
+		},
+		{
+			name: "parent permalink without query",
+			in:   "https://workspace.slack.com/archives/C1234567890/p1234567890123456",
+			want: &slackMessageRef{ChannelID: "C1234567890", Timestamp: "1234567890.123456"},
+			ok:   true,
+		},
+		{
+			name: "desktop client thread url",
+			in:   "https://app.slack.com/client/T123/C0C1WLW7LM8/thread/C0C1WLW7LM8-1793332203.161879",
+			want: &slackMessageRef{ChannelID: "C0C1WLW7LM8", Timestamp: "1793332203.161879"},
+			ok:   true,
+		},
+		{
+			name: "non-slack host",
+			in:   "https://example.com/archives/C1234567890/p1234567890123456",
+			ok:   false,
+		},
+		{
+			name: "not a message path",
+			in:   "https://workspace.slack.com/archives/C1234567890/not-a-timestamp",
+			ok:   false,
+		},
+		{
+			name: "plain search text",
+			in:   "marketing report",
+			ok:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseSlackMessageURL(tt.in)
+			if ok != tt.ok {
+				t.Fatalf("parseSlackMessageURL(%q) ok = %v, want %v", tt.in, ok, tt.ok)
+			}
+			if !tt.ok {
+				return
+			}
+			if *got != *tt.want {
+				t.Fatalf("parseSlackMessageURL(%q) = %+v, want %+v", tt.in, *got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestUnitSlackMessageRefRootTS(t *testing.T) {
+	ref := &slackMessageRef{Timestamp: "1793333904.614359", ThreadTS: "1793332203.161879"}
+	if got := ref.rootTS(); got != ref.ThreadTS {
+		t.Fatalf("rootTS() = %q, want thread ts %q", got, ref.ThreadTS)
+	}
+	ref.ThreadTS = ""
+	if got := ref.rootTS(); got != ref.Timestamp {
+		t.Fatalf("rootTS() = %q, want message ts %q", got, ref.Timestamp)
+	}
+}
+
+func TestUnitFilterMessagesByQuery(t *testing.T) {
+	messages := []Message{
+		{Text: "The build is green", UserName: "alice"},
+		{Text: "The build failed", UserName: "bob"},
+		{Text: "Unrelated message", UserName: "carol"},
+	}
+	got := filterMessagesByQuery(messages, "build green alice")
+	if len(got) != 1 || got[0].Text != "The build is green" {
+		t.Fatalf("filterMessagesByQuery returned %+v, want the single alice message", got)
+	}
+	if got := filterMessagesByQuery(messages, "   "); len(got) != len(messages) {
+		t.Fatalf("empty query returned %d messages, want %d", len(got), len(messages))
+	}
+}
+
+func TestUnitThreadMessageMatches(t *testing.T) {
+	msg := slack.Message{Msg: slack.Msg{
+		User:      "U123",
+		Text:      "Status on my slices",
+		Timestamp: "1793333904.614359",
+	}}
+
+	tests := []struct {
+		name    string
+		terms   []string
+		filters map[string][]string
+		want    bool
+	}{
+		{"matches text terms", []string{"status", "slices"}, nil, true},
+		{"rejects missing term", []string{"status", "missing"}, nil, false},
+		{"matches from filter", []string{"status"}, map[string][]string{"from": {"<@U123>"}}, true},
+		{"rejects wrong from filter", []string{"status"}, map[string][]string{"from": {"<@U999>"}}, false},
+		{"matches on date", nil, map[string][]string{"on": {"2026-10-30"}}, true},
+		{"rejects wrong on date", nil, map[string][]string{"on": {"2026-10-31"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := threadMessageMatches(msg, tt.terms, tt.filters); got != tt.want {
+				t.Fatalf("threadMessageMatches() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -29,8 +29,10 @@ import (
 
 const (
 	defaultConversationsNumericLimit    = 50
+	defaultThreadNumericLimit           = 200
 	defaultConversationsExpressionLimit = "1d"
 	maxFileSizeBytes                    = 5 * 1024 * 1024 // 5MB limit
+	maxThreadSearchMessages             = 5000            // safety cap when scanning a whole thread
 )
 
 var validFilterKeys = map[string]struct{}{
@@ -80,6 +82,8 @@ type UserSearchResult struct {
 
 type conversationParams struct {
 	channel  string
+	threadTs string
+	query    string
 	limit    int
 	oldest   string
 	latest   string
@@ -91,6 +95,37 @@ type searchParams struct {
 	query string
 	limit int
 	page  int
+	// threadTs restricts the search to a single thread. threadChannel is the
+	// channel that owns that thread (resolved from filter_in_channel).
+	threadTs      string
+	threadChannel string
+	// messageRef is set when search_query is a full Slack message URL.
+	messageRef *slackMessageRef
+	// freeText and filters are the parsed parts of search_query. They are used
+	// for thread-local filtering, where Slack's search API cannot help.
+	freeText []string
+	filters  map[string][]string
+	// cursor is the mode-specific cursor decoded from the request cursor.
+	cursor     string
+	cursorMode string
+}
+
+// slackMessageRef is a channel/message/thread reference parsed from a Slack
+// permalink such as
+// https://example.slack.com/archives/C123/p1234567890123456?thread_ts=1234567890.123456
+type slackMessageRef struct {
+	ChannelID string
+	Timestamp string
+	ThreadTS  string
+}
+
+// rootTS returns the timestamp that identifies the thread containing the
+// referenced message. For a top-level message that is the message itself.
+func (r *slackMessageRef) rootTS() string {
+	if r.ThreadTS != "" {
+		return r.ThreadTS
+	}
+	return r.Timestamp
 }
 
 type addMessageParams struct {
@@ -522,7 +557,8 @@ func escapeJSON(s string) string {
 	return s
 }
 
-// ConversationsHistoryHandler streams conversation history as CSV
+// ConversationsHistoryHandler streams conversation history as CSV. When
+// thread_ts is supplied it returns that thread instead of the channel history.
 func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("ConversationsHistoryHandler called", zap.Any("params", request.Params))
 
@@ -533,11 +569,16 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 	}
 	ch.logger.Debug("History params parsed",
 		zap.String("channel", params.channel),
+		zap.String("thread_ts", params.threadTs),
 		zap.Int("limit", params.limit),
 		zap.String("oldest", params.oldest),
 		zap.String("latest", params.latest),
 		zap.Bool("include_activity", params.activity),
 	)
+
+	if params.threadTs != "" {
+		return ch.threadReplies(ctx, params)
+	}
 
 	historyParams := slack.GetConversationHistoryParameters{
 		ChannelID: params.channel,
@@ -572,15 +613,41 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 		ch.logger.Error("Failed to parse replies params", zap.Error(err))
 		return nil, err
 	}
-	threadTs := request.GetString("thread_ts", "")
-	if threadTs == "" {
-		ch.logger.Error("thread_ts not provided for replies", zap.String("thread_ts", threadTs))
-		return nil, errors.New("thread_ts must be a string")
+	if params.threadTs == "" {
+		ch.logger.Error("thread_ts not provided for replies")
+		return nil, errors.New("thread_ts must be a timestamp or a full Slack message URL")
 	}
+	return ch.threadReplies(ctx, params)
+}
 
+// threadReplies fetches and serializes a thread. An optional query filters the
+// returned messages by text after they are read from Slack.
+func (ch *ConversationsHandler) threadReplies(ctx context.Context, params *conversationParams) (*mcp.CallToolResult, error) {
+	replies, hasMore, nextCursor, err := ch.getConversationReplies(ctx, params)
+	if err != nil {
+		ch.logger.Error("GetConversationRepliesContext failed", zap.Error(err))
+		return nil, err
+	}
+	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
+
+	messages := ch.convertMessagesFromHistory(ctx, replies, params.channel, params.activity)
+	if params.query != "" {
+		messages = filterMessagesByQuery(messages, params.query)
+	}
+	if len(messages) > 0 && hasMore {
+		messages[len(messages)-1].Cursor = nextCursor
+	}
+	return marshalMessagesToCSV(messages)
+}
+
+// getConversationReplies reads a thread. If the supplied timestamp belongs to
+// a reply rather than the thread parent, Slack returns only that one message;
+// in that case retry with the parent timestamp so callers still get the whole
+// thread.
+func (ch *ConversationsHandler) getConversationReplies(ctx context.Context, params *conversationParams) ([]slack.Message, bool, string, error) {
 	repliesParams := slack.GetConversationRepliesParameters{
 		ChannelID: params.channel,
-		Timestamp: threadTs,
+		Timestamp: params.threadTs,
 		Limit:     params.limit,
 		Oldest:    params.oldest,
 		Latest:    params.latest,
@@ -589,16 +656,14 @@ func (ch *ConversationsHandler) ConversationsRepliesHandler(ctx context.Context,
 	}
 	replies, hasMore, nextCursor, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
 	if err != nil {
-		ch.logger.Error("GetConversationRepliesContext failed", zap.Error(err))
-		return nil, err
+		return nil, false, "", err
 	}
-	ch.logger.Debug("Fetched conversation replies", zap.Int("count", len(replies)))
-
-	messages := ch.convertMessagesFromHistory(ctx, replies, params.channel, params.activity)
-	if len(messages) > 0 && hasMore {
-		messages[len(messages)-1].Cursor = nextCursor
+	if len(replies) == 1 && replies[0].ThreadTimestamp != "" && replies[0].ThreadTimestamp != params.threadTs {
+		repliesParams.Timestamp = replies[0].ThreadTimestamp
+		repliesParams.Cursor = ""
+		return ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &repliesParams)
 	}
-	return marshalMessagesToCSV(messages)
+	return replies, hasMore, nextCursor, nil
 }
 
 func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -609,6 +674,20 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 		ch.logger.Error("Failed to parse search params", zap.Error(err))
 		return nil, err
 	}
+
+	// A Slack message URL is resolved directly. This is the reliable way to
+	// read a message that lives in a thread: Slack search can return the reply
+	// but it drops the surrounding thread context.
+	if params.messageRef != nil {
+		return ch.searchThreadURL(ctx, params)
+	}
+
+	// Slack's search API cannot filter by thread, so when thread_ts is given
+	// fetch the thread and filter it locally.
+	if params.threadTs != "" {
+		return ch.searchThread(ctx, params)
+	}
+
 	ch.logger.Debug("Search params parsed", zap.String("query", params.query), zap.Int("limit", params.limit), zap.Int("page", params.page))
 
 	searchParams := slack.SearchParameters{
@@ -633,9 +712,150 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	messages := ch.convertMessagesFromSearch(ctx, messagesRes.Matches)
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
-		messages[len(messages)-1].Cursor = base64.StdEncoding.EncodeToString([]byte(nextCursor))
+		messages[len(messages)-1].Cursor = encodeSearchCursor("page", nextCursor[len("page:"):])
 	}
 	return marshalMessagesToCSV(messages)
+}
+
+// searchThreadURL reads a thread referenced by a full Slack message URL.
+func (ch *ConversationsHandler) searchThreadURL(ctx context.Context, params *searchParams) (*mcp.CallToolResult, error) {
+	ref := params.messageRef
+	cursor := ""
+	if params.cursorMode == "thread" {
+		cursor = params.cursor
+	}
+	cp := &conversationParams{
+		channel:  ref.ChannelID,
+		threadTs: ref.rootTS(),
+		limit:    params.limit,
+		cursor:   cursor,
+	}
+	messages, err := ch.threadMessages(ctx, cp)
+	if err != nil {
+		return nil, err
+	}
+
+	// threadMessages puts Slack's raw next cursor on the last row. Re-encode it
+	// so a cursor produced by this tool can be decoded by parseParamsToolSearch.
+	if len(messages) > 0 && messages[len(messages)-1].Cursor != "" {
+		messages[len(messages)-1].Cursor = encodeSearchCursor("thread", messages[len(messages)-1].Cursor)
+	}
+	return marshalMessagesToCSV(messages)
+}
+
+// threadMessages fetches a thread without serializing it.
+func (ch *ConversationsHandler) threadMessages(ctx context.Context, params *conversationParams) ([]Message, error) {
+	replies, hasMore, nextCursor, err := ch.getConversationReplies(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	messages := ch.convertMessagesFromHistory(ctx, replies, params.channel, params.activity)
+	if len(messages) > 0 && hasMore {
+		messages[len(messages)-1].Cursor = nextCursor
+	}
+	return messages, nil
+}
+
+// searchThread searches inside one thread by reading its replies and applying
+// the parsed query filters locally.
+func (ch *ConversationsHandler) searchThread(ctx context.Context, params *searchParams) (*mcp.CallToolResult, error) {
+	if params.threadChannel == "" {
+		return nil, errors.New("filter_in_channel is required when thread_ts is set (or use a full Slack message URL)")
+	}
+
+	all, err := ch.fetchAllThreadMessages(ctx, params.threadChannel, params.threadTs)
+	if err != nil {
+		ch.logger.Error("Failed to fetch thread for search", zap.Error(err))
+		return nil, err
+	}
+
+	matched := make([]slack.Message, 0, len(all))
+	for _, msg := range all {
+		if threadMessageMatches(msg, params.freeText, params.filters) {
+			matched = append(matched, msg)
+		}
+	}
+	ch.logger.Debug("Thread search completed",
+		zap.String("channel", params.threadChannel),
+		zap.String("thread_ts", params.threadTs),
+		zap.Int("messages", len(all)),
+		zap.Int("matches", len(matched)),
+	)
+
+	offset := 0
+	if params.cursorMode == "tsearch" {
+		if n, err := strconv.Atoi(params.cursor); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	if offset > len(matched) {
+		offset = len(matched)
+	}
+	end := offset + params.limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+
+	messages := ch.convertMessagesFromHistory(ctx, matched[offset:end], params.threadChannel, false)
+	if end < len(matched) && len(messages) > 0 {
+		messages[len(messages)-1].Cursor = encodeSearchCursor("tsearch", strconv.Itoa(end))
+	}
+	return marshalMessagesToCSV(messages)
+}
+
+// fetchAllThreadMessages pages through a thread up to maxThreadSearchMessages.
+func (ch *ConversationsHandler) fetchAllThreadMessages(ctx context.Context, channel, threadTs string) ([]slack.Message, error) {
+	const repliesPageSize = 200
+	lim := limiter.Tier3.Limiter()
+
+	var all []slack.Message
+	cursor := ""
+	resolvedRoot := false
+	for {
+		params := slack.GetConversationRepliesParameters{
+			ChannelID: channel,
+			Timestamp: threadTs,
+			Limit:     repliesPageSize,
+			Cursor:    cursor,
+			Inclusive: false,
+		}
+		replies, hasMore, nextCursor, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &params)
+		if err != nil {
+			return nil, err
+		}
+		if !resolvedRoot {
+			resolvedRoot = true
+			// A reply timestamp returns just that reply. Retry from its parent
+			// so a search targeting a reply URL sees the whole thread.
+			if len(replies) == 1 && replies[0].ThreadTimestamp != "" && replies[0].ThreadTimestamp != threadTs {
+				threadTs = replies[0].ThreadTimestamp
+				continue
+			}
+		}
+		all = append(all, replies...)
+		if !hasMore || nextCursor == "" || nextCursor == cursor {
+			break
+		}
+		if len(all) >= maxThreadSearchMessages {
+			ch.logger.Warn("Thread search capped; returning a partial thread",
+				zap.String("channel", channel),
+				zap.String("thread_ts", threadTs),
+				zap.Int("messages", len(all)))
+			break
+		}
+		cursor = nextCursor
+		if err := lim.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if len(all) > maxThreadSearchMessages {
+		all = all[:maxThreadSearchMessages]
+	}
+	return all, nil
+}
+
+func encodeSearchCursor(mode, value string) string {
+	return base64.StdEncoding.EncodeToString([]byte(mode + ":" + value))
 }
 
 // UnreadChannel represents a channel with unread messages
@@ -1681,15 +1901,41 @@ func (ch *ConversationsHandler) convertMessagesFromSearch(ctx context.Context, s
 }
 
 func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context, request mcp.CallToolRequest) (*conversationParams, error) {
-	channel := request.GetString("channel_id", "")
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+
+	var threadTs string
+	if raw := strings.TrimSpace(request.GetString("thread_ts", "")); raw != "" {
+		if ref, ok := parseSlackMessageURL(raw); ok {
+			threadTs = ref.rootTS()
+			if channel == "" {
+				channel = ref.ChannelID
+			}
+		} else if ts, ok := normalizeSlackTS(raw); ok {
+			threadTs = ts
+		} else {
+			return nil, fmt.Errorf("thread_ts must be a timestamp in format 1234567890.123456 or a full Slack message URL")
+		}
+	}
+
 	if channel == "" {
 		ch.logger.Error("channel_id missing in conversations params")
-		return nil, errors.New("channel_id must be a string")
+		return nil, errors.New("channel_id must be a string (or provide a full Slack message URL as thread_ts)")
 	}
 
 	limit := request.GetString("limit", "")
+	limitProvided := false
+	if args := request.GetArguments(); args != nil {
+		_, limitProvided = args["limit"]
+	}
+	// Thread reads should not be truncated to today's messages by default.
+	// The tool schema default is "1d" for channel history; when the caller did
+	// not explicitly ask for a time window, fetch a numeric page instead.
+	if threadTs != "" && !limitProvided {
+		limit = ""
+	}
 	cursor := request.GetString("cursor", "")
 	activity := request.GetBool("include_activity_messages", false)
+	query := strings.TrimSpace(request.GetString("query", ""))
 
 	var (
 		paramLimit  int
@@ -1697,14 +1943,18 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 		paramLatest string
 		err         error
 	)
-	if strings.HasSuffix(limit, "d") || strings.HasSuffix(limit, "w") || strings.HasSuffix(limit, "m") {
+	if isDurationLimit(limit) {
 		paramLimit, paramOldest, paramLatest, err = limitByExpression(limit, defaultConversationsExpressionLimit)
 		if err != nil {
 			ch.logger.Error("Invalid duration limit", zap.String("limit", limit), zap.Error(err))
 			return nil, err
 		}
 	} else if cursor == "" {
-		paramLimit, err = limitByNumeric(limit, defaultConversationsNumericLimit)
+		numericDefault := defaultConversationsNumericLimit
+		if threadTs != "" {
+			numericDefault = defaultThreadNumericLimit
+		}
+		paramLimit, err = limitByNumeric(limit, numericDefault)
 		if err != nil {
 			ch.logger.Error("Invalid numeric limit", zap.String("limit", limit), zap.Error(err))
 			return nil, err
@@ -1737,12 +1987,26 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 
 	return &conversationParams{
 		channel:  channel,
+		threadTs: threadTs,
+		query:    query,
 		limit:    paramLimit,
 		oldest:   paramOldest,
 		latest:   paramLatest,
 		cursor:   cursor,
 		activity: activity,
 	}, nil
+}
+
+// isDurationLimit reports whether limit is a human duration such as 30m, 2h,
+// 3d or 1w rather than a plain message count.
+func isDurationLimit(limit string) bool {
+	l := strings.ToLower(strings.TrimSpace(limit))
+	if l == "" {
+		return false
+	}
+	return strings.HasSuffix(l, "min") || strings.HasSuffix(l, "d") ||
+		strings.HasSuffix(l, "w") || strings.HasSuffix(l, "m") ||
+		strings.HasSuffix(l, "h") || strings.HasSuffix(l, "s")
 }
 
 func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, request mcp.CallToolRequest) (*addMessageParams, error) {
@@ -1993,95 +2257,162 @@ func (ch *ConversationsHandler) parseParamsToolMark(request mcp.CallToolRequest)
 }
 func (ch *ConversationsHandler) parseParamsToolSearch(ctx context.Context, req mcp.CallToolRequest) (*searchParams, error) {
 	rawQuery := strings.TrimSpace(req.GetString("search_query", ""))
-	freeText, filters := splitQuery(rawQuery)
-
-	if req.GetBool("filter_threads_only", false) {
-		addFilter(filters, "is", "thread")
+	params := &searchParams{
+		query: rawQuery,
+		limit: req.GetInt("limit", 100),
+		page:  1,
 	}
-	if chName := req.GetString("filter_in_channel", ""); chName != "" {
-		f, err := ch.paramFormatChannel(chName)
-		if err != nil {
-			ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
-			return nil, err
-		}
-		addFilter(filters, "in", f)
-	} else if im := req.GetString("filter_in_im_or_mpim", ""); im != "" {
-		f, err := ch.paramFormatUser(ctx, im)
-		if err != nil {
-			ch.logger.Error("Invalid IM/MPIM filter", zap.String("filter", im), zap.Error(err))
-			return nil, err
-		}
-		addFilter(filters, "in", f)
-	}
-	if with := req.GetString("filter_users_with", ""); with != "" {
-		f, err := ch.paramFormatUser(ctx, with)
-		if err != nil {
-			ch.logger.Error("Invalid with-user filter", zap.String("filter", with), zap.Error(err))
-			return nil, err
-		}
-		addFilter(filters, "with", f)
-	}
-	if from := req.GetString("filter_users_from", ""); from != "" {
-		f, err := ch.paramFormatUser(ctx, from)
-		if err != nil {
-			ch.logger.Error("Invalid from-user filter", zap.String("filter", from), zap.Error(err))
-			return nil, err
-		}
-		addFilter(filters, "from", f)
+	limitProvided := false
+	if args := req.GetArguments(); args != nil {
+		_, limitProvided = args["limit"]
 	}
 
-	dateMap, err := buildDateFilters(
-		req.GetString("filter_date_before", ""),
-		req.GetString("filter_date_after", ""),
-		req.GetString("filter_date_on", ""),
-		req.GetString("filter_date_during", ""),
-	)
-	if err != nil {
-		ch.logger.Error("Invalid date filters", zap.Error(err))
-		return nil, err
-	}
-	for key, val := range dateMap {
-		addFilter(filters, key, val)
+	// A full Slack message URL is resolved directly rather than sent to
+	// Slack's search API. Other filters are ignored for URL searches, as
+	// documented on the tool.
+	if ref, ok := parseSlackMessageURL(rawQuery); ok {
+		params.messageRef = ref
+		if !limitProvided {
+			params.limit = defaultThreadNumericLimit
+		}
+	} else {
+		freeText, filters := splitQuery(rawQuery)
+		params.freeText = freeText
+		params.filters = filters
+
+		if req.GetBool("filter_threads_only", false) {
+			addFilter(filters, "is", "thread")
+		}
+
+		rawThreadTs := strings.TrimSpace(req.GetString("thread_ts", ""))
+		if rawThreadTs != "" {
+			if ref, ok := parseSlackMessageURL(rawThreadTs); ok {
+				params.threadTs = ref.rootTS()
+				if params.threadChannel == "" {
+					params.threadChannel = ref.ChannelID
+				}
+			} else if ts, ok := normalizeSlackTS(rawThreadTs); ok {
+				params.threadTs = ts
+			} else {
+				return nil, fmt.Errorf("thread_ts must be a timestamp in format 1234567890.123456 or a full Slack message URL")
+			}
+		}
+
+		if chName := strings.TrimSpace(req.GetString("filter_in_channel", "")); chName != "" {
+			if isSlackChannelID(chName) {
+				// Channel IDs are enough for a thread search and do not need
+				// the channels cache. For a normal search we still need the
+				// name for Slack's in: filter.
+				params.threadChannel = chName
+				if params.threadTs == "" {
+					f, err := ch.paramFormatChannel(chName)
+					if err != nil {
+						ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
+						return nil, err
+					}
+					addFilter(filters, "in", f)
+				}
+			} else {
+				f, err := ch.paramFormatChannel(chName)
+				if err != nil {
+					ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
+					return nil, err
+				}
+				id, err := ch.resolveChannelID(ctx, chName)
+				if err != nil {
+					ch.logger.Error("Invalid channel filter", zap.String("filter", chName), zap.Error(err))
+					return nil, err
+				}
+				params.threadChannel = id
+				if params.threadTs == "" {
+					addFilter(filters, "in", f)
+				}
+			}
+		} else if im := req.GetString("filter_in_im_or_mpim", ""); im != "" {
+			f, err := ch.paramFormatUser(ctx, im)
+			if err != nil {
+				ch.logger.Error("Invalid IM/MPIM filter", zap.String("filter", im), zap.Error(err))
+				return nil, err
+			}
+			addFilter(filters, "in", f)
+		}
+		if with := req.GetString("filter_users_with", ""); with != "" {
+			f, err := ch.paramFormatUser(ctx, with)
+			if err != nil {
+				ch.logger.Error("Invalid with-user filter", zap.String("filter", with), zap.Error(err))
+				return nil, err
+			}
+			addFilter(filters, "with", f)
+		}
+		if from := req.GetString("filter_users_from", ""); from != "" {
+			f, err := ch.paramFormatUser(ctx, from)
+			if err != nil {
+				ch.logger.Error("Invalid from-user filter", zap.String("filter", from), zap.Error(err))
+				return nil, err
+			}
+			addFilter(filters, "from", f)
+		}
+
+		dateMap, err := buildDateFilters(
+			req.GetString("filter_date_before", ""),
+			req.GetString("filter_date_after", ""),
+			req.GetString("filter_date_on", ""),
+			req.GetString("filter_date_during", ""),
+		)
+		if err != nil {
+			ch.logger.Error("Invalid date filters", zap.Error(err))
+			return nil, err
+		}
+		for key, val := range dateMap {
+			addFilter(filters, key, val)
+		}
+		params.query = buildQuery(freeText, filters)
 	}
 
-	finalQuery := buildQuery(freeText, filters)
-	limit := req.GetInt("limit", 100)
 	cursor := req.GetString("cursor", "")
-
-	var (
-		page          int
-		decodedCursor []byte
-	)
 	if cursor != "" {
-		decodedCursor, err = base64.StdEncoding.DecodeString(cursor)
+		decoded, err := base64.StdEncoding.DecodeString(cursor)
 		if err != nil {
 			ch.logger.Error("Invalid cursor decoding", zap.String("cursor", cursor), zap.Error(err))
 			return nil, fmt.Errorf("invalid cursor: %v", err)
 		}
-		parts := strings.Split(string(decodedCursor), ":")
+		parts := strings.SplitN(string(decoded), ":", 2)
 		if len(parts) != 2 {
 			ch.logger.Error("Invalid cursor format", zap.String("cursor", cursor))
 			return nil, fmt.Errorf("invalid cursor: %v", cursor)
 		}
-		page, err = strconv.Atoi(parts[1])
-		if err != nil || page < 1 {
-			ch.logger.Error("Invalid cursor page", zap.String("cursor", cursor), zap.Error(err))
-			return nil, fmt.Errorf("invalid cursor page: %v", err)
+		params.cursorMode = parts[0]
+		params.cursor = parts[1]
+		switch parts[0] {
+		case "page":
+			page, err := strconv.Atoi(parts[1])
+			if err != nil || page < 1 {
+				ch.logger.Error("Invalid cursor page", zap.String("cursor", cursor), zap.Error(err))
+				return nil, fmt.Errorf("invalid cursor page: %v", err)
+			}
+			params.page = page
+		case "thread", "tsearch":
+			// Handled by the thread-based search paths.
+		default:
+			ch.logger.Error("Invalid cursor mode", zap.String("cursor", cursor))
+			return nil, fmt.Errorf("invalid cursor: %v", cursor)
 		}
-	} else {
-		page = 1
+	}
+
+	if params.messageRef == nil && params.threadTs == "" && params.cursorMode != "" && params.cursorMode != "page" {
+		return nil, fmt.Errorf("cursor was produced by a thread search; pass the same thread_ts or Slack URL")
+	}
+	if params.threadTs != "" && params.threadChannel == "" {
+		return nil, errors.New("filter_in_channel is required when thread_ts is set (or use a full Slack message URL)")
 	}
 
 	ch.logger.Debug("Search parameters built",
-		zap.String("query", finalQuery),
-		zap.Int("limit", limit),
-		zap.Int("page", page),
+		zap.String("query", params.query),
+		zap.String("thread_ts", params.threadTs),
+		zap.Int("limit", params.limit),
+		zap.Int("page", params.page),
 	)
-	return &searchParams{
-		query: finalQuery,
-		limit: limit,
-		page:  page,
-	}, nil
+	return params, nil
 }
 
 // Slack user IDs may begin with U or W: https://docs.slack.dev/changelog/2016/08/11/user-id-format-changes
@@ -2208,29 +2539,47 @@ func limitByExpression(limit, defaultLimit string) (slackLimit int, oldest, late
 	if limit == "" {
 		limit = defaultLimit
 	}
+	limit = strings.ToLower(strings.TrimSpace(limit))
 	if len(limit) < 2 {
 		return 0, "", "", fmt.Errorf("invalid duration limit %q: too short", limit)
 	}
-	suffix := limit[len(limit)-1]
-	numStr := limit[:len(limit)-1]
+
+	var (
+		suffix string
+		numStr string
+	)
+	if strings.HasSuffix(limit, "min") {
+		suffix = "min"
+		numStr = strings.TrimSuffix(limit, "min")
+	} else {
+		suffix = limit[len(limit)-1:]
+		numStr = limit[:len(limit)-1]
+	}
 	n, err := strconv.Atoi(numStr)
 	if err != nil || n <= 0 {
-		return 0, "", "", fmt.Errorf("invalid duration limit %q: must be a positive integer followed by 'd', 'w', or 'm'", limit)
+		return 0, "", "", fmt.Errorf("invalid duration limit %q: must be a positive integer followed by 's', 'min', 'h', 'd', 'w', or 'm'", limit)
 	}
+
 	now := time.Now()
 	loc := now.Location()
 	startOfToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
 	var oldestTime time.Time
 	switch suffix {
-	case 'd':
+	case "s":
+		oldestTime = now.Add(-time.Duration(n) * time.Second)
+	case "min":
+		oldestTime = now.Add(-time.Duration(n) * time.Minute)
+	case "h":
+		oldestTime = now.Add(-time.Duration(n) * time.Hour)
+	case "d":
 		oldestTime = startOfToday.AddDate(0, 0, -n+1)
-	case 'w':
+	case "w":
 		oldestTime = startOfToday.AddDate(0, 0, -n*7+1)
-	case 'm':
+	case "m":
 		oldestTime = startOfToday.AddDate(0, -n, 0)
 	default:
-		return 0, "", "", fmt.Errorf("invalid duration limit %q: must end in 'd', 'w', or 'm'", limit)
+		return 0, "", "", fmt.Errorf("invalid duration limit %q: must end in 's', 'min', 'h', 'd', 'w', or 'm'", limit)
 	}
 	latest = fmt.Sprintf("%d.000000", now.Unix())
 	oldest = fmt.Sprintf("%d.000000", oldestTime.Unix())
@@ -2243,6 +2592,195 @@ func extractThreadTS(rawurl string) (string, error) {
 		return "", err
 	}
 	return u.Query().Get("thread_ts"), nil
+}
+
+// normalizeSlackTS accepts either a regular Slack timestamp
+// ("1234567890.123456"), the p-prefixed form used in permalinks
+// ("p1234567890123456"), or the bare 16-digit form and returns the regular
+// dotted timestamp.
+func normalizeSlackTS(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "p")
+	if s == "" {
+		return "", false
+	}
+	if strings.Contains(s, ".") {
+		parts := strings.SplitN(s, ".", 2)
+		if len(parts) != 2 || !allDigits(parts[0]) || !allDigits(parts[1]) {
+			return "", false
+		}
+		return s, true
+	}
+	if !allDigits(s) || len(s) <= 6 {
+		return "", false
+	}
+	return s[:len(s)-6] + "." + s[len(s)-6:], true
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isSlackChannelID(s string) bool {
+	return strings.HasPrefix(s, "C") || strings.HasPrefix(s, "G") || strings.HasPrefix(s, "D")
+}
+
+// parseSlackMessageURL parses the permalink formats Slack uses in its web and
+// desktop clients:
+//
+//	https://workspace.slack.com/archives/C123/p1234567890123456
+//	https://workspace.slack.com/archives/C123/p1234567890123456?thread_ts=1234567890.123456
+//	https://app.slack.com/client/T123/C123/thread/C123-1234567890.123456
+func parseSlackMessageURL(raw string) (*slackMessageRef, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, false
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "slack.com" && !strings.HasSuffix(host, ".slack.com") {
+		return nil, false
+	}
+
+	ref := &slackMessageRef{}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, part := range parts {
+		switch {
+		case part == "archives" && i+2 < len(parts):
+			ref.ChannelID = parts[i+1]
+			if strings.HasPrefix(parts[i+2], "p") {
+				if ts, ok := normalizeSlackTS(parts[i+2]); ok {
+					ref.Timestamp = ts
+				}
+			}
+		case part == "thread" && i+1 < len(parts):
+			// app.slack.com/client/T123/C123/thread/C123-1234567890.123456
+			seg := parts[i+1]
+			if idx := strings.LastIndex(seg, "-"); idx > 0 {
+				ref.ChannelID = seg[:idx]
+				if ts, ok := normalizeSlackTS(seg[idx+1:]); ok {
+					ref.Timestamp = ts
+				}
+			}
+		}
+	}
+
+	q := u.Query()
+	if ref.ChannelID == "" {
+		ref.ChannelID = q.Get("cid")
+	}
+	if t := q.Get("thread_ts"); t != "" {
+		if ts, ok := normalizeSlackTS(t); ok {
+			ref.ThreadTS = ts
+		}
+	}
+
+	if ref.ChannelID == "" || !isSlackChannelID(ref.ChannelID) || ref.Timestamp == "" {
+		return nil, false
+	}
+	return ref, true
+}
+
+// filterMessagesByQuery keeps messages whose text or author matches every
+// whitespace-separated term in query.
+func filterMessagesByQuery(messages []Message, query string) []Message {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return messages
+	}
+	out := make([]Message, 0, len(messages))
+	for _, msg := range messages {
+		haystack := strings.ToLower(msg.Text + " " + msg.UserName + " " + msg.RealName)
+		matched := true
+		for _, term := range terms {
+			if !strings.Contains(haystack, term) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+// threadMessageMatches applies the parsed search query to a thread message.
+// Slack's search API cannot target a single thread, so these filters mirror the
+// search syntax locally.
+func threadMessageMatches(msg slack.Message, terms []string, filters map[string][]string) bool {
+	body := msg.Text
+	if body == "" {
+		body = text.BlocksToText(msg.Blocks)
+	}
+	haystack := strings.ToLower(body)
+	for _, term := range terms {
+		if !strings.Contains(haystack, strings.ToLower(term)) {
+			return false
+		}
+	}
+
+	for _, value := range filters["from"] {
+		uid := strings.TrimSuffix(strings.TrimPrefix(value, "<@"), ">")
+		if msg.User != uid {
+			return false
+		}
+	}
+
+	return slackMessageMatchesDateFilters(msg.Timestamp, filters)
+}
+
+func slackMessageMatchesDateFilters(ts string, filters map[string][]string) bool {
+	msgTime, ok := parseSlackTimestamp(ts)
+	if !ok {
+		return true
+	}
+	msgDate := time.Date(msgTime.Year(), msgTime.Month(), msgTime.Day(), 0, 0, 0, 0, time.UTC)
+
+	for _, value := range filters["on"] {
+		d, err := time.Parse("2006-01-02", value)
+		if err == nil && !msgDate.Equal(d) {
+			return false
+		}
+	}
+	for _, value := range filters["during"] {
+		d, err := time.Parse("2006-01-02", value)
+		if err == nil && !msgDate.Equal(d) {
+			return false
+		}
+	}
+	for _, value := range filters["after"] {
+		d, err := time.Parse("2006-01-02", value)
+		if err == nil && msgDate.Before(d) {
+			return false
+		}
+	}
+	for _, value := range filters["before"] {
+		d, err := time.Parse("2006-01-02", value)
+		if err == nil && !msgDate.Before(d) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseSlackTimestamp(ts string) (time.Time, bool) {
+	sec, err := strconv.ParseFloat(ts, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(sec), 0).UTC(), true
 }
 
 func parseFlexibleDate(dateStr string) (time.Time, string, error) {

@@ -32,21 +32,23 @@ This feature-rich Slack MCP Server has:
 ## Tools
 
 ### 1. conversations_history:
-Get messages from the channel (or DM) by channel_id, the last row/column in the response is used as 'cursor' parameter for pagination if not empty
+Get messages from the channel (or DM) by channel_id, the last row/column in the response is used as 'cursor' parameter for pagination if not empty. When `thread_ts` is provided, this returns the thread's messages instead of the channel history, including replies that are not broadcast to the channel.
 - **Parameters:**
-  - `channel_id` (string, required):     - `channel_id` (string): ID of the channel in format Cxxxxxxxxxx or its name starting with `#...` or `@...` aka `#general` or `@username_dm`.
+  - `channel_id` (string): ID of the channel in format Cxxxxxxxxxx or its name starting with `#...` or `@...` aka `#general` or `@username_dm`. Optional when `thread_ts` is a full Slack message URL.
+  - `thread_ts` (string, optional): Thread parent timestamp in format `1234567890.123456`, or a full Slack message URL such as `https://workspace.slack.com/archives/C123/p1234567890123456?thread_ts=1234567890.123456`. When set, the tool returns the thread rather than channel history.
   - `include_activity_messages` (boolean, default: false): If true, the response will include activity messages such as `channel_join` or `channel_leave`. Default is boolean false.
   - `cursor` (string, optional): Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request.
-  - `limit` (string, default: "1d"): Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 1w - 1 week, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided.
+  - `limit` (string, default: "1d"): Limit of messages to fetch in format of maximum ranges of time (e.g. `30min` - 30 minutes, `2h` - 2 hours, `1d` - 1 day, `1w` - 1 week, `30d` - 30 days, `90d` - 90 days which is a default limit for free tier history) or number of messages (e.g. `50`). Must be empty when 'cursor' is provided. Thread reads default to a numeric page when no limit is supplied.
 
 ### 2. conversations_replies:
-Get a thread of messages posted to a conversation by channelID and `thread_ts`, the last row/column in the response is used as `cursor` parameter for pagination if not empty.
+Get a thread of messages posted to a conversation by channelID and `thread_ts`, the last row/column in the response is used as `cursor` parameter for pagination if not empty. This is the reliable way to read replies that are not broadcast to a channel; channel history only returns the parent message.
 - **Parameters:**
-  - `channel_id` (string, required): ID of the channel in format `Cxxxxxxxxxx` or its name starting with `#...` or `@...` aka `#general` or `@username_dm`.
-  - `thread_ts` (string, required): Unique identifier of either a thread’s parent message or a message in the thread. ts must be the timestamp in format `1234567890.123456` of an existing message with 0 or more replies.
+  - `channel_id` (string): ID of the channel in format `Cxxxxxxxxxx` or its name starting with `#...` or `@...` aka `#general` or `@username_dm`. Optional when `thread_ts` is a full Slack message URL.
+  - `thread_ts` (string, required): Unique identifier of either a thread's parent message or a message in the thread, in format `1234567890.123456`, or a full Slack message URL such as `https://workspace.slack.com/archives/C123/p1234567890123456?thread_ts=1234567890.123456`.
+  - `query` (string, optional): Case-insensitive text filter applied after the thread is read. All whitespace-separated terms must match.
   - `include_activity_messages` (boolean, default: false): If true, the response will include activity messages such as 'channel_join' or 'channel_leave'. Default is boolean false.
   - `cursor` (string, optional): Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request.
-  - `limit` (string, default: "1d"): Limit of messages to fetch in format of maximum ranges of time (e.g. 1d - 1 day, 1w - 1 week, 30d - 30 days, 90d - 90 days which is a default limit for free tier history) or number of messages (e.g. 50). Must be empty when 'cursor' is provided.
+  - `limit` (string, default: "1d"): Limit of messages to fetch in format of maximum ranges of time (e.g. `30min` - 30 minutes, `2h` - 2 hours, `1d` - 1 day, `30d` - 30 days, `90d` - 90 days) or number of messages (e.g. `50`). Must be empty when 'cursor' is provided. Thread reads default to a numeric page when no limit is supplied.
 
 ### 3. conversations_add_message
 Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts.
@@ -60,11 +62,12 @@ Add a message to a public channel, private channel, or direct message (DM, or IM
   - `content_type` (string, default: "text/markdown"): Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'.
 
 ### 4. conversations_search_messages
-Search messages in a public channel, private channel, or direct message (DM, or IM) conversation using filters. All filters are optional, if not provided then search_query is required.
+Search messages in a public channel, private channel, or direct message (DM, or IM) conversation using filters. All filters are optional, if not provided then search_query is required. When `search_query` is a full Slack message URL, the message's thread is returned directly. When `thread_ts` is provided, the search is restricted to that thread.
 
 > **Note**: This tool is not available when using bot tokens (`xoxb-*`). Bot tokens cannot use the `search.messages` API.
 - **Parameters:**
-  - `search_query` (string, optional): Search query to filter messages. Example: 'marketing report' or full URL of Slack message e.g. 'https://slack.com/archives/C1234567890/p1234567890123456', then the tool will return a single message matching given URL, herewith all other parameters will be ignored.
+  - `search_query` (string, optional): Search query to filter messages. Example: 'marketing report'. When given a full Slack message URL, for example `https://workspace.slack.com/archives/C1234567890/p1234567890123456?thread_ts=1234567890.123456`, the tool resolves that URL directly and returns the message's thread; all other parameters are ignored.
+  - `thread_ts` (string, optional): Restrict the search to one thread. Provide a thread parent timestamp in format `1234567890.123456` or a full Slack message URL. Requires `filter_in_channel` unless the URL contains the channel.
   - `filter_in_channel` (string, optional): Filter messages in a specific channel by its ID or name. Example: `C1234567890` or `#general`. If not provided, all channels will be searched.
   - `filter_in_im_or_mpim` (string, optional): Filter messages in a direct message (DM) or multi-person direct message (MPIM) conversation by its ID or name. Example: `D1234567890` or `@username_dm`. If not provided, all DMs and MPIMs will be searched.
   - `filter_users_with` (string, optional): Filter messages with a specific user by their ID or display name in threads and DMs. Example: `U1234567890` or `@username`. If not provided, all threads and DMs will be searched.
