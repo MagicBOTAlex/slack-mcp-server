@@ -790,7 +790,7 @@ func TestUnitThreadMessageMatches(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := threadMessageMatches(msg, tt.terms, tt.filters); got != tt.want {
+			if got := threadMessageMatches(msg, tt.terms, tt.filters, nil); got != tt.want {
 				t.Fatalf("threadMessageMatches() = %v, want %v", got, tt.want)
 			}
 		})
@@ -842,5 +842,42 @@ func TestUnitSlackPermalink(t *testing.T) {
 				t.Fatalf("slackPermalink() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestUnitExtractSlackFileID(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"F0C8W511RN3", "F0C8W511RN3"},
+		{"https://eqcompany.slack.com/docs/T0BAFDAHF38/F0C8W511RN3", "F0C8W511RN3"},
+		{"https://eqcompany.slack.com/lists/T0BAFDAHF38/F0CE33FC8CU?view_id=123", "F0CE33FC8CU"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := extractSlackFileID(tt.in); got != tt.want {
+				t.Fatalf("extractSlackFileID(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnitSlackMessageMatchesDateFiltersTimezone(t *testing.T) {
+	// 2026-10-30 23:30 UTC is 2026-10-31 01:30 in Amsterdam.
+	msgTime := time.Date(2026, 10, 30, 23, 30, 0, 0, time.UTC)
+	ts := fmt.Sprintf("%d.000000", msgTime.Unix())
+	filters := map[string][]string{"on": {"2026-10-31"}}
+
+	amsterdam, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatalf("failed to load timezone: %v", err)
+	}
+	if !slackMessageMatchesDateFilters(ts, filters, amsterdam) {
+		t.Fatal("expected message to match 2026-10-31 in Europe/Amsterdam")
+	}
+	if slackMessageMatchesDateFilters(ts, filters, time.UTC) {
+		t.Fatal("expected message not to match 2026-10-31 in UTC")
 	}
 }

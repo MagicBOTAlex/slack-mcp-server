@@ -216,9 +216,12 @@ type SlackAPI interface {
 	GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error)
 	GetUsersInfo(users ...string) (*[]slack.User, error)
 	PostMessageContext(ctx context.Context, channel string, options ...slack.MsgOption) (string, string, error)
+	UpdateMessageContext(ctx context.Context, channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
+	DeleteMessageContext(ctx context.Context, channel, messageTimestamp string) (string, string, error)
 	MarkConversationContext(ctx context.Context, channel, ts string) error
 	AddReactionContext(ctx context.Context, name string, item slack.ItemRef) error
 	RemoveReactionContext(ctx context.Context, name string, item slack.ItemRef) error
+	GetReactionsContext(ctx context.Context, item slack.ItemRef, params slack.GetReactionsParameters) (slack.ReactedItem, error)
 	LeaveConversationContext(ctx context.Context, channelID string) (bool, error)
 	JoinConversationContext(ctx context.Context, channelID string) (*slack.Channel, string, []string, error)
 
@@ -230,9 +233,18 @@ type SlackAPI interface {
 	// Used to get files
 	GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*slack.File, []slack.Comment, *slack.Paging, error)
 	GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error
+	GetFilesContext(ctx context.Context, params slack.GetFilesParameters) ([]slack.File, *slack.Paging, error)
+	UploadFileContext(ctx context.Context, params slack.UploadFileParameters) (*slack.FileSummary, error)
+
+	// Users
+	GetUserPresenceContext(ctx context.Context, user string) (*slack.UserPresence, error)
 
 	// Used to get channel info (for unread counts with xoxp tokens)
 	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
+
+	// Pins and members
+	ListPinsContext(ctx context.Context, channel string) ([]slack.Item, *slack.Paging, error)
+	GetUsersInConversationContext(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error)
 
 	// Used to get channels list from both Slack and Enterprise Grid versions
 	GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
@@ -250,6 +262,7 @@ type SlackAPI interface {
 	SavedList(ctx context.Context, filter string, limit int, cursor string) (edge.SavedListResponse, error)
 	SavedUpdate(ctx context.Context, itemType, itemID, ts, mark string, dateDue int64) error
 	SavedClearCompleted(ctx context.Context) error
+	ListsRecordsList(ctx context.Context, listID string, limit int, cursor string) (edge.ListsRecordsResponse, error)
 
 	// User groups API methods
 	GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error)
@@ -533,12 +546,24 @@ func (c *MCPSlackClient) PostMessageContext(ctx context.Context, channelID strin
 	return c.slackClient.PostMessageContext(ctx, channelID, options...)
 }
 
+func (c *MCPSlackClient) UpdateMessageContext(ctx context.Context, channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error) {
+	return c.slackClient.UpdateMessageContext(ctx, channelID, timestamp, options...)
+}
+
+func (c *MCPSlackClient) DeleteMessageContext(ctx context.Context, channel, messageTimestamp string) (string, string, error) {
+	return c.slackClient.DeleteMessageContext(ctx, channel, messageTimestamp)
+}
+
 func (c *MCPSlackClient) AddReactionContext(ctx context.Context, name string, item slack.ItemRef) error {
 	return c.slackClient.AddReactionContext(ctx, name, item)
 }
 
 func (c *MCPSlackClient) RemoveReactionContext(ctx context.Context, name string, item slack.ItemRef) error {
 	return c.slackClient.RemoveReactionContext(ctx, name, item)
+}
+
+func (c *MCPSlackClient) GetReactionsContext(ctx context.Context, item slack.ItemRef, params slack.GetReactionsParameters) (slack.ReactedItem, error) {
+	return c.slackClient.GetReactionsContext(ctx, item, params)
 }
 
 func (c *MCPSlackClient) GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*slack.File, []slack.Comment, *slack.Paging, error) {
@@ -549,8 +574,28 @@ func (c *MCPSlackClient) GetFileContext(ctx context.Context, downloadURL string,
 	return c.slackClient.GetFileContext(ctx, downloadURL, writer)
 }
 
+func (c *MCPSlackClient) GetFilesContext(ctx context.Context, params slack.GetFilesParameters) ([]slack.File, *slack.Paging, error) {
+	return c.slackClient.GetFilesContext(ctx, params)
+}
+
+func (c *MCPSlackClient) UploadFileContext(ctx context.Context, params slack.UploadFileParameters) (*slack.FileSummary, error) {
+	return c.slackClient.UploadFileContext(ctx, params)
+}
+
+func (c *MCPSlackClient) GetUserPresenceContext(ctx context.Context, user string) (*slack.UserPresence, error) {
+	return c.slackClient.GetUserPresenceContext(ctx, user)
+}
+
 func (c *MCPSlackClient) GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
 	return c.slackClient.GetConversationInfoContext(ctx, input)
+}
+
+func (c *MCPSlackClient) ListPinsContext(ctx context.Context, channel string) ([]slack.Item, *slack.Paging, error) {
+	return c.slackClient.ListPinsContext(ctx, channel)
+}
+
+func (c *MCPSlackClient) GetUsersInConversationContext(ctx context.Context, params *slack.GetUsersInConversationParameters) ([]string, string, error) {
+	return c.slackClient.GetUsersInConversationContext(ctx, params)
 }
 
 func (c *MCPSlackClient) ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error) {
@@ -579,6 +624,10 @@ func (c *MCPSlackClient) SavedUpdate(ctx context.Context, itemType, itemID, ts, 
 
 func (c *MCPSlackClient) SavedClearCompleted(ctx context.Context) error {
 	return c.edgeClient.SavedClearCompleted(ctx)
+}
+
+func (c *MCPSlackClient) ListsRecordsList(ctx context.Context, listID string, limit int, cursor string) (edge.ListsRecordsResponse, error) {
+	return c.edgeClient.ListsRecordsList(ctx, listID, limit, cursor)
 }
 
 func (c *MCPSlackClient) GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {

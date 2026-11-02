@@ -44,6 +44,16 @@ const (
 	ToolUsergroupsUpdate            = "usergroups_update"
 	ToolUsergroupsUsersUpdate       = "usergroups_users_update"
 	ToolUsersSearch                 = "users_search"
+	ToolConversationsInfo           = "conversations_info"
+	ToolReactionsList               = "reactions_list"
+	ToolPinsList                    = "pins_list"
+	ToolChannelMembers              = "channel_members"
+	ToolConversationsEditMessage    = "conversations_edit_message"
+	ToolConversationsDeleteMessage  = "conversations_delete_message"
+	ToolFilesList                   = "files_list"
+	ToolFilesUpload                 = "files_upload"
+	ToolCanvasRead                  = "canvas_read"
+	ToolListsItemsList              = "lists_items_list"
 	ToolSavedList                   = "saved_list"
 	ToolSavedUpdate                 = "saved_update"
 	ToolSavedClearCompleted         = "saved_clear_completed"
@@ -69,6 +79,16 @@ var ValidToolNames = []string{
 	ToolUsergroupsUpdate,
 	ToolUsergroupsUsersUpdate,
 	ToolUsersSearch,
+	ToolConversationsInfo,
+	ToolReactionsList,
+	ToolPinsList,
+	ToolChannelMembers,
+	ToolConversationsEditMessage,
+	ToolConversationsDeleteMessage,
+	ToolFilesList,
+	ToolFilesUpload,
+	ToolCanvasRead,
+	ToolListsItemsList,
 	ToolSavedList,
 	ToolSavedUpdate,
 	ToolSavedClearCompleted,
@@ -141,6 +161,16 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.Description("If true, the response will include activity messages such as 'channel_join' or 'channel_leave'. Default is boolean false."),
 				mcp.DefaultBool(false),
 			),
+			mcp.WithBoolean("include_thread_replies",
+				mcp.Description("If true, thread replies are expanded inline after each parent message. Capped at 1000 messages to avoid unbounded crawls."),
+				mcp.DefaultBool(false),
+			),
+			mcp.WithString("oldest_ts",
+				mcp.Description("Optional absolute oldest Slack timestamp (e.g. 1793332203.161879). Overrides the relative limit window."),
+			),
+			mcp.WithString("latest_ts",
+				mcp.Description("Optional absolute latest Slack timestamp (e.g. 1793333904.614359). Overrides the relative limit window."),
+			),
 			mcp.WithString("cursor",
 				mcp.Description("Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request."),
 			),
@@ -170,6 +200,12 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.Description("If true, the response will include activity messages such as 'channel_join' or 'channel_leave'. Default is boolean false."),
 				mcp.DefaultBool(false),
 			),
+			mcp.WithString("oldest_ts",
+				mcp.Description("Optional absolute oldest Slack timestamp (e.g. 1793332203.161879). Overrides the relative limit window."),
+			),
+			mcp.WithString("latest_ts",
+				mcp.Description("Optional absolute latest Slack timestamp (e.g. 1793333904.614359). Overrides the relative limit window."),
+			),
 			mcp.WithString("cursor",
 				mcp.Description("Cursor for pagination. Use the value of the last row and column in the response as next_cursor field returned from the previous request."),
 			),
@@ -178,6 +214,192 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.Description("Limit of messages to fetch in format of maximum ranges of time (e.g. 30min - 30 minutes, 2h - 2 hours, 1d - 1 day, 30d - 30 days, 90d - 90 days) or number of messages (e.g. 50). Must be empty when 'cursor' is provided."),
 			),
 		), conversationsHandler.ConversationsRepliesHandler)
+	}
+
+	if shouldAddTool(ToolConversationsInfo, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolConversationsInfo,
+			mcp.WithDescription("Get channel metadata and read state: name, privacy, archive/member state, topic, purpose, member count, latest message, unread count, and last_read."),
+			mcp.WithTitleAnnotation("Get Channel Info"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+		), conversationsHandler.ConversationsInfoHandler)
+	}
+
+	if shouldAddTool(ToolReactionsList, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolReactionsList,
+			mcp.WithDescription("List all reactions on a message, including the users who reacted."),
+			mcp.WithTitleAnnotation("List Reactions"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+			mcp.WithString("timestamp",
+				mcp.Required(),
+				mcp.Description("Message timestamp, e.g. 1793333904.614359."),
+			),
+		), conversationsHandler.ReactionsListHandler)
+	}
+
+	if shouldAddTool(ToolPinsList, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolPinsList,
+			mcp.WithDescription("List pinned messages and files in a channel."),
+			mcp.WithTitleAnnotation("List Pins"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+		), conversationsHandler.PinsListHandler)
+	}
+
+	if shouldAddTool(ToolChannelMembers, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolChannelMembers,
+			mcp.WithDescription("List members of a channel with resolved names and bot/admin flags."),
+			mcp.WithTitleAnnotation("List Channel Members"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+			mcp.WithNumber("limit",
+				mcp.DefaultNumber(100),
+				mcp.Description("Maximum members to return (1-1000)."),
+			),
+			mcp.WithString("cursor",
+				mcp.Description("Pagination cursor from next_cursor."),
+			),
+		), conversationsHandler.ChannelMembersHandler)
+	}
+
+	if shouldAddTool(ToolConversationsEditMessage, enabledTools, "SLACK_MCP_EDIT_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsEditMessage,
+			mcp.WithDescription("Edit a message previously posted by the authenticated user. Requires SLACK_MCP_EDIT_MESSAGE_TOOL."),
+			mcp.WithTitleAnnotation("Edit Message"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+			mcp.WithString("timestamp",
+				mcp.Required(),
+				mcp.Description("Timestamp of the message to edit, e.g. 1793333904.614359."),
+			),
+			mcp.WithString("text",
+				mcp.Description("New message text. 'payload' is accepted as an alias."),
+			),
+			mcp.WithString("content_type",
+				mcp.DefaultString("text/markdown"),
+				mcp.Description("Content type: text/markdown or text/plain."),
+			),
+			mcp.WithString("blocks",
+				mcp.Description("Raw Slack Block Kit JSON array. Takes precedence over text."),
+			),
+		), conversationsHandler.ConversationsEditMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsDeleteMessage, enabledTools, "SLACK_MCP_DELETE_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsDeleteMessage,
+			mcp.WithDescription("Delete a message previously posted by the authenticated user. Requires SLACK_MCP_DELETE_MESSAGE_TOOL."),
+			mcp.WithTitleAnnotation("Delete Message"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+			mcp.WithString("timestamp",
+				mcp.Required(),
+				mcp.Description("Timestamp of the message to delete, e.g. 1793333904.614359."),
+			),
+		), conversationsHandler.ConversationsDeleteMessageHandler)
+	}
+
+	if shouldAddTool(ToolFilesList, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolFilesList,
+			mcp.WithDescription("List files in a channel or workspace. Use types='canvas' to discover Slack canvases, or types='list' for Lists."),
+			mcp.WithTitleAnnotation("List Files"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Description("Optional channel ID or name. Omit to list workspace files."),
+			),
+			mcp.WithString("types",
+				mcp.DefaultString("all"),
+				mcp.Description("Comma-separated file types, e.g. all, canvas, list, images, documents, pdfs."),
+			),
+			mcp.WithNumber("limit",
+				mcp.DefaultNumber(100),
+				mcp.Description("Maximum files to return (1-1000)."),
+			),
+			mcp.WithNumber("page",
+				mcp.DefaultNumber(1),
+				mcp.Description("Page number (1-based)."),
+			),
+		), conversationsHandler.FilesListHandler)
+	}
+
+	if shouldAddTool(ToolFilesUpload, enabledTools, "SLACK_MCP_UPLOAD_FILE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolFilesUpload,
+			mcp.WithDescription("Upload a text or base64-encoded file to a channel, optionally in a thread. Requires SLACK_MCP_UPLOAD_FILE_TOOL. Maximum size is 5MB."),
+			mcp.WithTitleAnnotation("Upload File"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("Channel ID (C.../G.../D...) or name starting with #.../@...."),
+			),
+			mcp.WithString("filename",
+				mcp.Required(),
+				mcp.Description("Filename to show in Slack, e.g. report.md."),
+			),
+			mcp.WithString("content",
+				mcp.Description("Text content. Mutually exclusive with content_base64."),
+			),
+			mcp.WithString("content_base64",
+				mcp.Description("Base64-encoded binary content. Mutually exclusive with content."),
+			),
+			mcp.WithString("title",
+				mcp.Description("Optional file title."),
+			),
+			mcp.WithString("initial_comment",
+				mcp.Description("Optional message posted with the file."),
+			),
+			mcp.WithString("thread_ts",
+				mcp.Description("Optional thread parent timestamp to upload into a thread."),
+			),
+		), conversationsHandler.FilesUploadHandler)
+	}
+
+	if shouldAddTool(ToolCanvasRead, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolCanvasRead,
+			mcp.WithDescription("Read a Slack canvas by file ID or canvas URL. Returns metadata and the canvas content converted to plain text."),
+			mcp.WithTitleAnnotation("Read Canvas"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("file_id",
+				mcp.Required(),
+				mcp.Description("Canvas file ID (F...) or a Slack docs URL containing it."),
+			),
+		), conversationsHandler.CanvasReadHandler)
+	}
+
+	if shouldAddTool(ToolListsItemsList, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolListsItemsList,
+			mcp.WithDescription("Read records from a Slack List by list ID (F...). The webclient internal endpoint is used, which works with xoxc/xoxd session tokens."),
+			mcp.WithTitleAnnotation("Read Slack List"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("list_id",
+				mcp.Required(),
+				mcp.Description("Slack List file ID (F...) or a List URL containing it."),
+			),
+			mcp.WithNumber("limit",
+				mcp.DefaultNumber(100),
+				mcp.Description("Maximum records to return (1-1000)."),
+			),
+			mcp.WithString("cursor",
+				mcp.Description("Pagination cursor from next_cursor."),
+			),
+		), conversationsHandler.ListsItemsListHandler)
 	}
 
 	if shouldAddTool(ToolConversationsAddMessage, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
@@ -289,6 +511,9 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		mcp.WithString("filter_date_during",
 			mcp.Description("Filter messages sent during a specific period in format 'YYYY-MM-DD'. Example: 'July', 'Yesterday' or 'Today'. If not provided, all dates will be searched."),
 		),
+		mcp.WithString("filter_date_timezone",
+			mcp.Description("Optional IANA timezone for date filters, e.g. 'Europe/Amsterdam'. Applies to thread-local filtering and re-checks normal search results in that timezone."),
+		),
 		mcp.WithBoolean("filter_threads_only",
 			mcp.Description("If true, the response will include only messages from threads. Default is boolean false."),
 		),
@@ -318,6 +543,10 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 			mcp.WithNumber("limit",
 				mcp.DefaultNumber(10),
 				mcp.Description("Maximum number of results to return (1-100). Default is 10."),
+			),
+			mcp.WithBoolean("include_presence",
+				mcp.Description("If true, fetch live presence (active/away) for each result. Adds one API call per user."),
+				mcp.DefaultBool(false),
 			),
 		), conversationsHandler.UsersSearchHandler)
 	}

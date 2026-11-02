@@ -33,6 +33,7 @@ const (
 	defaultConversationsExpressionLimit = "1d"
 	maxFileSizeBytes                    = 5 * 1024 * 1024 // 5MB limit
 	maxThreadSearchMessages             = 5000            // safety cap when scanning a whole thread
+	maxExpandedHistoryMessages          = 1000            // safety cap for include_thread_replies
 )
 
 var validFilterKeys = map[string]struct{}{
@@ -84,18 +85,60 @@ type UserSearchResult struct {
 	TimeZone       string `csv:"TimeZone"`
 	TimeZoneLabel  string `csv:"TimeZoneLabel"`
 	TimeZoneOffset int    `csv:"TimeZoneOffset"`
+	LocalTime      string `csv:"LocalTime"`
+	Presence       string `csv:"Presence"`
+	StatusText     string `csv:"StatusText"`
+	StatusEmoji    string `csv:"StatusEmoji"`
+	Phone          string `csv:"Phone"`
 	DMChannelID    string `csv:"DMChannelID"`
 }
 
+type ReactionRow struct {
+	Reaction string `csv:"Reaction"`
+	Count    int    `csv:"Count"`
+	Users    string `csv:"Users"`
+}
+
+type PinRow struct {
+	Type      string `csv:"Type"`
+	Channel   string `csv:"Channel"`
+	Timestamp string `csv:"Timestamp"`
+	UserID    string `csv:"UserID"`
+	Text      string `csv:"Text"`
+	FileID    string `csv:"FileID"`
+	FileName  string `csv:"FileName"`
+	Permalink string `csv:"Permalink"`
+}
+
+type MemberRow struct {
+	UserID   string `json:"userID"`
+	UserName string `json:"userName"`
+	RealName string `json:"realName"`
+	IsBot    bool   `json:"isBot"`
+	IsAdmin  bool   `json:"isAdmin"`
+}
+
+type FileRow struct {
+	ID        string `csv:"ID"`
+	Name      string `csv:"Name"`
+	Title     string `csv:"Title"`
+	FileType  string `csv:"FileType"`
+	Mimetype  string `csv:"Mimetype"`
+	Size      int    `csv:"Size"`
+	UserID    string `csv:"UserID"`
+	Permalink string `csv:"Permalink"`
+}
+
 type conversationParams struct {
-	channel  string
-	threadTs string
-	query    string
-	limit    int
-	oldest   string
-	latest   string
-	cursor   string
-	activity bool
+	channel              string
+	threadTs             string
+	query                string
+	limit                int
+	oldest               string
+	latest               string
+	cursor               string
+	activity             bool
+	includeThreadReplies bool
 }
 
 type searchParams struct {
@@ -115,6 +158,9 @@ type searchParams struct {
 	// cursor is the mode-specific cursor decoded from the request cursor.
 	cursor     string
 	cursorMode string
+	// dateLocation is set when filter_date_timezone is supplied. It is used
+	// for thread-local filtering and for filtering search results client-side.
+	dateLocation *time.Location
 }
 
 // slackMessageRef is a channel/message/thread reference parsed from a Slack
@@ -156,6 +202,65 @@ type filesGetParams struct {
 type usersSearchParams struct {
 	query string
 	limit int
+}
+
+type conversationInfoParams struct {
+	channel string
+}
+
+type reactionsListParams struct {
+	channel   string
+	timestamp string
+}
+
+type pinsListParams struct {
+	channel string
+}
+
+type membersParams struct {
+	channel string
+	limit   int
+	cursor  string
+}
+
+type editMessageParams struct {
+	channel     string
+	timestamp   string
+	text        string
+	contentType string
+	blocks      []slack.Block
+}
+
+type deleteMessageParams struct {
+	channel   string
+	timestamp string
+}
+
+type uploadFileParams struct {
+	channel   string
+	filename  string
+	content   string
+	content64 string
+	title     string
+	comment   string
+	threadTs  string
+}
+
+type filesListParams struct {
+	channel string
+	types   string
+	limit   int
+	page    int
+}
+
+type canvasReadParams struct {
+	fileID string
+}
+
+type listsItemsParams struct {
+	listID string
+	limit  int
+	cursor string
 }
 
 type unreadsParams struct {
@@ -424,6 +529,8 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 	}
 
 	channelsMap := ch.apiProvider.ProvideChannelsMaps()
+	includePresence := request.GetBool("include_presence", false)
+	presenceLimiter := limiter.Tier2boost.Limiter()
 
 	results := make([]UserSearchResult, 0, len(users))
 	for _, user := range users {
@@ -439,6 +546,21 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 			}
 		}
 
+		localTime := ""
+		if user.TZ != "" {
+			if loc, err := time.LoadLocation(user.TZ); err == nil {
+				localTime = time.Now().In(loc).Format("2006-01-02 15:04 MST")
+			}
+		}
+		presence := ""
+		if includePresence {
+			if err := presenceLimiter.Wait(ctx); err == nil {
+				if p, err := ch.apiProvider.Slack().GetUserPresenceContext(ctx, user.ID); err == nil {
+					presence = p.Presence
+				}
+			}
+		}
+
 		results = append(results, UserSearchResult{
 			UserID:         user.ID,
 			UserName:       user.Name,
@@ -449,6 +571,11 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 			TimeZone:       user.TZ,
 			TimeZoneLabel:  user.TZLabel,
 			TimeZoneOffset: user.TZOffset,
+			LocalTime:      localTime,
+			Presence:       presence,
+			StatusText:     user.Profile.StatusText,
+			StatusEmoji:    user.Profile.StatusEmoji,
+			Phone:          user.Profile.Phone,
 			DMChannelID:    dmChannelID,
 		})
 	}
@@ -464,6 +591,327 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 	}
 
 	return mcp.NewToolResultText(string(csvBytes)), nil
+}
+
+// ConversationsInfoHandler returns channel metadata and read state.
+func (ch *ConversationsHandler) ConversationsInfoHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		return nil, err
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := ch.apiProvider.Slack().GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+		ChannelID:         id,
+		IncludeNumMembers: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := map[string]any{
+		"id":                   info.ID,
+		"name":                 info.Name,
+		"is_channel":           info.IsChannel,
+		"is_private":           info.IsPrivate,
+		"is_archived":          info.IsArchived,
+		"is_general":           info.IsGeneral,
+		"is_member":            info.IsMember,
+		"is_im":                info.IsIM,
+		"is_mpim":              info.IsMpIM,
+		"is_shared":            info.IsShared,
+		"is_ext_shared":        info.IsExtShared,
+		"is_org_shared":        info.IsOrgShared,
+		"num_members":          info.NumMembers,
+		"creator":              info.Creator,
+		"created":              info.Created,
+		"topic":                info.Topic.Value,
+		"purpose":              info.Purpose.Value,
+		"last_read":            info.LastRead,
+		"unread_count":         info.UnreadCount,
+		"unread_count_display": info.UnreadCountDisplay,
+	}
+	if info.Latest != nil {
+		result["latest"] = info.Latest.Timestamp
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (ch *ConversationsHandler) ReactionsListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolReactionsList(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	reacted, err := ch.apiProvider.Slack().GetReactionsContext(ctx, slack.ItemRef{
+		Channel:   params.channel,
+		Timestamp: params.timestamp,
+	}, slack.GetReactionsParameters{Full: true})
+	if err != nil {
+		return nil, err
+	}
+	if len(reacted.Reactions) == 0 {
+		return mcp.NewToolResultText("No reactions found."), nil
+	}
+
+	resolver := ch.newUserResolver(ctx)
+	rows := make([]ReactionRow, 0, len(reacted.Reactions))
+	for _, r := range reacted.Reactions {
+		names := make([]string, 0, len(r.Users))
+		for _, uid := range r.Users {
+			name, _, _ := resolver.resolve(uid)
+			if name == "" {
+				name = uid
+			}
+			names = append(names, name)
+		}
+		rows = append(rows, ReactionRow{Reaction: r.Name, Count: r.Count, Users: strings.Join(names, ",")})
+	}
+	return marshalRowsToCSV(rows)
+}
+
+func (ch *ConversationsHandler) PinsListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolPinsList(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	items, _, err := ch.apiProvider.Slack().ListPinsContext(ctx, params.channel)
+	if err != nil {
+		return nil, err
+	}
+	baseURL := ch.workspaceBaseURL()
+	rows := make([]PinRow, 0, len(items))
+	for _, item := range items {
+		row := PinRow{Type: item.Type, Channel: item.Channel, Timestamp: item.Timestamp}
+		if item.Message != nil {
+			row.UserID = item.Message.User
+			row.Text = text.ProcessText(item.Message.Text)
+			row.Timestamp = item.Message.Timestamp
+			row.Permalink = slackPermalink(baseURL, item.Channel, item.Message.Timestamp, item.Message.ThreadTimestamp)
+		}
+		if item.File != nil {
+			row.FileID = item.File.ID
+			row.FileName = item.File.Name
+			row.Permalink = item.File.Permalink
+		}
+		rows = append(rows, row)
+	}
+	return marshalRowsToCSV(rows)
+}
+
+func (ch *ConversationsHandler) ChannelMembersHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolMembers(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		return nil, err
+	}
+	ids, nextCursor, err := ch.apiProvider.Slack().GetUsersInConversationContext(ctx, &slack.GetUsersInConversationParameters{
+		ChannelID: params.channel,
+		Limit:     params.limit,
+		Cursor:    params.cursor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	usersMap := ch.apiProvider.ProvideUsersMap()
+	members := make([]MemberRow, 0, len(ids))
+	for _, id := range ids {
+		row := MemberRow{UserID: id, UserName: id, RealName: id}
+		if u, ok := usersMap.Users[id]; ok {
+			row.UserName = u.Name
+			row.RealName = u.RealName
+			row.IsBot = u.IsBot
+			row.IsAdmin = u.IsAdmin
+		}
+		members = append(members, row)
+	}
+	data, err := json.Marshal(map[string]any{
+		"channel_id":  params.channel,
+		"members":     members,
+		"next_cursor": nextCursor,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (ch *ConversationsHandler) ConversationsEditMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolEditMessage(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	options, err := buildMessageOptions(params.text, params.contentType, params.blocks)
+	if err != nil {
+		return nil, err
+	}
+	channel, ts, _, err := ch.apiProvider.Slack().UpdateMessageContext(ctx, params.channel, params.timestamp, options...)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Message %s updated in channel %s", ts, channel)), nil
+}
+
+func (ch *ConversationsHandler) ConversationsDeleteMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolDeleteMessage(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	channel, ts, err := ch.apiProvider.Slack().DeleteMessageContext(ctx, params.channel, params.timestamp)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Message %s deleted from channel %s", ts, channel)), nil
+}
+
+func (ch *ConversationsHandler) FilesUploadHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolUploadFile(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	data := []byte(params.content)
+	if params.content64 != "" {
+		data, err = base64.StdEncoding.DecodeString(params.content64)
+		if err != nil {
+			return nil, fmt.Errorf("content_base64 is not valid base64: %w", err)
+		}
+	}
+	if len(data) == 0 {
+		return nil, errors.New("provide either content or content_base64")
+	}
+	if len(data) > maxFileSizeBytes {
+		return nil, fmt.Errorf("file size %d bytes exceeds maximum allowed size of %d bytes", len(data), maxFileSizeBytes)
+	}
+
+	file, err := ch.apiProvider.Slack().UploadFileContext(ctx, slack.UploadFileParameters{
+		Filename:        params.filename,
+		FileSize:        len(data),
+		Content:         string(data),
+		Title:           params.title,
+		InitialComment:  params.comment,
+		Channel:         params.channel,
+		ThreadTimestamp: params.threadTs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Uploaded %s (%s, %d bytes) to channel %s", file.Title, file.ID, len(data), params.channel)), nil
+}
+
+func (ch *ConversationsHandler) FilesListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolFilesList(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	files, paging, err := ch.apiProvider.Slack().GetFilesContext(ctx, slack.GetFilesParameters{
+		Channel: params.channel,
+		Types:   params.types,
+		Count:   params.limit,
+		Page:    params.page,
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]FileRow, 0, len(files))
+	for _, f := range files {
+		rows = append(rows, FileRow{
+			ID:        f.ID,
+			Name:      f.Name,
+			Title:     f.Title,
+			FileType:  f.Filetype,
+			Mimetype:  f.Mimetype,
+			Size:      f.Size,
+			UserID:    f.User,
+			Permalink: f.Permalink,
+		})
+	}
+	result, err := marshalRowsToCSV(rows)
+	if err != nil {
+		return nil, err
+	}
+	if paging != nil && paging.Pages > 0 && paging.Page < paging.Pages {
+		result.Content = append(result.Content, mcp.TextContent{
+			Type: "text",
+			Text: fmt.Sprintf("\nNext page: %d", paging.Page+1),
+		})
+	}
+	return result, nil
+}
+
+func (ch *ConversationsHandler) CanvasReadHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolCanvasRead(request)
+	if err != nil {
+		return nil, err
+	}
+	fileInfo, _, _, err := ch.apiProvider.Slack().GetFileInfoContext(ctx, params.fileID, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	if fileInfo.Size > maxFileSizeBytes {
+		return nil, fmt.Errorf("canvas size %d bytes exceeds maximum allowed size of %d bytes", fileInfo.Size, maxFileSizeBytes)
+	}
+	downloadURL := fileInfo.URLPrivateDownload
+	if downloadURL == "" {
+		downloadURL = fileInfo.URLPrivate
+	}
+	if downloadURL == "" {
+		return nil, errors.New("canvas has no downloadable URL")
+	}
+	var buf bytes.Buffer
+	if err := ch.apiProvider.Slack().GetFileContext(ctx, downloadURL, &buf); err != nil {
+		return nil, err
+	}
+
+	content := buf.String()
+	if fileInfo.Filetype == "quip" || fileInfo.Mimetype == "application/vnd.slack-docs" || strings.Contains(content, "quip-canvas-content") {
+		content = text.HTMLToText(content)
+	}
+	result := map[string]any{
+		"file_id":   fileInfo.ID,
+		"title":     fileInfo.Title,
+		"name":      fileInfo.Name,
+		"filetype":  fileInfo.Filetype,
+		"permalink": fileInfo.Permalink,
+		"content":   content,
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+func (ch *ConversationsHandler) ListsItemsListHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	params, err := ch.parseParamsToolListsItems(request)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := ch.apiProvider.Slack().ListsRecordsList(ctx, params.listID, params.limit, params.cursor)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(map[string]any{
+		"list_id":     params.listID,
+		"records":     resp.Records,
+		"list":        resp.List,
+		"next_cursor": resp.ResponseMetadata.NextCursor,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(data)), nil
 }
 
 func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -606,12 +1054,59 @@ func (ch *ConversationsHandler) ConversationsHistoryHandler(ctx context.Context,
 
 	ch.logger.Debug("Fetched conversation history", zap.Int("message_count", len(history.Messages)))
 
-	messages := ch.convertMessagesFromHistory(ctx, history.Messages, params.channel, params.activity)
+	historyMessages := history.Messages
+	if params.includeThreadReplies {
+		historyMessages, err = ch.expandThreadReplies(ctx, historyMessages, params.channel)
+		if err != nil {
+			ch.logger.Error("Failed to expand thread replies", zap.Error(err))
+			return nil, err
+		}
+	}
+
+	messages := ch.convertMessagesFromHistory(ctx, historyMessages, params.channel, params.activity)
 
 	if len(messages) > 0 && history.HasMore {
 		messages[len(messages)-1].Cursor = history.ResponseMetaData.NextCursor
 	}
 	return marshalMessagesToCSV(messages)
+}
+
+// expandThreadReplies appends thread replies after each parent message. It is
+// intentionally capped: a channel history request must not turn into an
+// unbounded crawl.
+func (ch *ConversationsHandler) expandThreadReplies(ctx context.Context, messages []slack.Message, channel string) ([]slack.Message, error) {
+	lim := limiter.Tier3.Limiter()
+	out := make([]slack.Message, 0, len(messages))
+	for _, msg := range messages {
+		out = append(out, msg)
+		if msg.ReplyCount == 0 {
+			continue
+		}
+		replies, err := ch.fetchAllThreadMessages(ctx, channel, msg.Timestamp)
+		if err != nil {
+			ch.logger.Warn("Failed to fetch thread replies; continuing with history",
+				zap.String("channel", channel),
+				zap.String("thread_ts", msg.Timestamp),
+				zap.Error(err))
+			continue
+		}
+		for i, reply := range replies {
+			if i == 0 && reply.Timestamp == msg.Timestamp {
+				continue
+			}
+			out = append(out, reply)
+		}
+		if len(out) >= maxExpandedHistoryMessages {
+			ch.logger.Warn("Inline thread expansion capped",
+				zap.String("channel", channel),
+				zap.Int("messages", len(out)))
+			break
+		}
+		if err := lim.Wait(ctx); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // ConversationsRepliesHandler streams thread replies as CSV
@@ -719,6 +1214,18 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	}
 	ch.logger.Debug("Search completed", zap.Int("matches", len(messagesRes.Matches)))
 
+	if params.dateLocation != nil {
+		// Slack applies date filters in the authenticated user's timezone. If
+		// the caller asked for a different timezone, re-check the date locally.
+		filtered := messagesRes.Matches[:0]
+		for _, match := range messagesRes.Matches {
+			if slackMessageMatchesDateFilters(match.Timestamp, params.filters, params.dateLocation) {
+				filtered = append(filtered, match)
+			}
+		}
+		messagesRes.Matches = filtered
+	}
+
 	messages := ch.convertMessagesFromSearch(ctx, messagesRes.Matches)
 	if len(messages) > 0 && messagesRes.Pagination.Page < messagesRes.Pagination.PageCount {
 		nextCursor := fmt.Sprintf("page:%d", messagesRes.Pagination.Page+1)
@@ -781,7 +1288,7 @@ func (ch *ConversationsHandler) searchThread(ctx context.Context, params *search
 
 	matched := make([]slack.Message, 0, len(all))
 	for _, msg := range all {
-		if threadMessageMatches(msg, params.freeText, params.filters) {
+		if threadMessageMatches(msg, params.freeText, params.filters, params.dateLocation) {
 			matched = append(matched, msg)
 		}
 	}
@@ -1960,6 +2467,7 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 	cursor := request.GetString("cursor", "")
 	activity := request.GetBool("include_activity_messages", false)
 	query := strings.TrimSpace(request.GetString("query", ""))
+	includeThreadReplies := request.GetBool("include_thread_replies", false)
 
 	var (
 		paramLimit  int
@@ -1983,6 +2491,22 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 			ch.logger.Error("Invalid numeric limit", zap.String("limit", limit), zap.Error(err))
 			return nil, err
 		}
+	}
+
+	// Absolute timestamps win over relative duration limits.
+	if raw := strings.TrimSpace(request.GetString("oldest_ts", "")); raw != "" {
+		ts, ok := normalizeSlackTS(raw)
+		if !ok {
+			return nil, errors.New("oldest_ts must be in format 1234567890.123456")
+		}
+		paramOldest = ts
+	}
+	if raw := strings.TrimSpace(request.GetString("latest_ts", "")); raw != "" {
+		ts, ok := normalizeSlackTS(raw)
+		if !ok {
+			return nil, errors.New("latest_ts must be in format 1234567890.123456")
+		}
+		paramLatest = ts
 	}
 
 	if strings.HasPrefix(channel, "#") || strings.HasPrefix(channel, "@") {
@@ -2010,14 +2534,15 @@ func (ch *ConversationsHandler) parseParamsToolConversations(ctx context.Context
 	}
 
 	return &conversationParams{
-		channel:  channel,
-		threadTs: threadTs,
-		query:    query,
-		limit:    paramLimit,
-		oldest:   paramOldest,
-		latest:   paramLatest,
-		cursor:   cursor,
-		activity: activity,
+		channel:              channel,
+		threadTs:             threadTs,
+		query:                query,
+		limit:                paramLimit,
+		oldest:               paramOldest,
+		latest:               paramLatest,
+		cursor:               cursor,
+		activity:             activity,
+		includeThreadReplies: includeThreadReplies,
 	}, nil
 }
 
@@ -2226,6 +2751,297 @@ func (ch *ConversationsHandler) parseParamsToolUsersSearch(request mcp.CallToolR
 	}, nil
 }
 
+func (ch *ConversationsHandler) parseParamsToolReactionsList(ctx context.Context, request mcp.CallToolRequest) (*reactionsListParams, error) {
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	timestamp := strings.TrimSpace(request.GetString("timestamp", ""))
+	ts, ok := normalizeSlackTS(timestamp)
+	if !ok {
+		return nil, errors.New("timestamp must be in format 1234567890.123456")
+	}
+	return &reactionsListParams{channel: id, timestamp: ts}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolPinsList(ctx context.Context, request mcp.CallToolRequest) (*pinsListParams, error) {
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	return &pinsListParams{channel: id}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolMembers(ctx context.Context, request mcp.CallToolRequest) (*membersParams, error) {
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	limit := request.GetInt("limit", 100)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	return &membersParams{
+		channel: id,
+		limit:   limit,
+		cursor:  request.GetString("cursor", ""),
+	}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolEditMessage(ctx context.Context, request mcp.CallToolRequest) (*editMessageParams, error) {
+	config, err := requiredWriteToolConfig("SLACK_MCP_EDIT_MESSAGE_TOOL", "conversations_edit_message")
+	if err != nil {
+		return nil, err
+	}
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	if !isChannelAllowedForConfig(id, config) {
+		return nil, fmt.Errorf("conversations_edit_message is not allowed for channel %q, applied policy: %s", id, config)
+	}
+	timestamp := strings.TrimSpace(request.GetString("timestamp", ""))
+	ts, ok := normalizeSlackTS(timestamp)
+	if !ok {
+		return nil, errors.New("timestamp must be in format 1234567890.123456")
+	}
+	msgText := request.GetString("text", "")
+	if msgText == "" {
+		msgText = request.GetString("payload", "")
+	}
+	contentType := request.GetString("content_type", "text/markdown")
+	if contentType != "text/plain" && contentType != "text/markdown" {
+		return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
+	}
+	blocks, err := parseBlocksArg(request)
+	if err != nil {
+		return nil, err
+	}
+	if msgText == "" && blocks == nil {
+		return nil, errors.New("either text or blocks must be provided")
+	}
+	return &editMessageParams{
+		channel:     id,
+		timestamp:   ts,
+		text:        msgText,
+		contentType: contentType,
+		blocks:      blocks,
+	}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolDeleteMessage(ctx context.Context, request mcp.CallToolRequest) (*deleteMessageParams, error) {
+	config, err := requiredWriteToolConfig("SLACK_MCP_DELETE_MESSAGE_TOOL", "conversations_delete_message")
+	if err != nil {
+		return nil, err
+	}
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	if !isChannelAllowedForConfig(id, config) {
+		return nil, fmt.Errorf("conversations_delete_message is not allowed for channel %q, applied policy: %s", id, config)
+	}
+	timestamp := strings.TrimSpace(request.GetString("timestamp", ""))
+	ts, ok := normalizeSlackTS(timestamp)
+	if !ok {
+		return nil, errors.New("timestamp must be in format 1234567890.123456")
+	}
+	return &deleteMessageParams{channel: id, timestamp: ts}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolUploadFile(ctx context.Context, request mcp.CallToolRequest) (*uploadFileParams, error) {
+	config, err := requiredWriteToolConfig("SLACK_MCP_UPLOAD_FILE_TOOL", "files_upload")
+	if err != nil {
+		return nil, err
+	}
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel == "" {
+		return nil, errors.New("channel_id must be a string")
+	}
+	id, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	if !isChannelAllowedForConfig(id, config) {
+		return nil, fmt.Errorf("files_upload is not allowed for channel %q, applied policy: %s", id, config)
+	}
+	filename := strings.TrimSpace(request.GetString("filename", ""))
+	if filename == "" {
+		return nil, errors.New("filename is required")
+	}
+	content := request.GetString("content", "")
+	content64 := strings.TrimSpace(request.GetString("content_base64", ""))
+	if content == "" && content64 == "" {
+		return nil, errors.New("provide either content or content_base64")
+	}
+	var threadTs string
+	if raw := strings.TrimSpace(request.GetString("thread_ts", "")); raw != "" {
+		ts, ok := normalizeSlackTS(raw)
+		if !ok {
+			return nil, errors.New("thread_ts must be in format 1234567890.123456")
+		}
+		threadTs = ts
+	}
+	return &uploadFileParams{
+		channel:   id,
+		filename:  filename,
+		content:   content,
+		content64: content64,
+		title:     request.GetString("title", ""),
+		comment:   request.GetString("initial_comment", ""),
+		threadTs:  threadTs,
+	}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolFilesList(ctx context.Context, request mcp.CallToolRequest) (*filesListParams, error) {
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	if channel != "" {
+		id, err := ch.resolveChannelID(ctx, channel)
+		if err != nil {
+			return nil, err
+		}
+		channel = id
+	}
+	types := strings.TrimSpace(request.GetString("types", "all"))
+	if types == "" {
+		types = "all"
+	}
+	limit := request.GetInt("limit", 100)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	page := request.GetInt("page", 1)
+	if page < 1 {
+		page = 1
+	}
+	return &filesListParams{channel: channel, types: types, limit: limit, page: page}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolCanvasRead(request mcp.CallToolRequest) (*canvasReadParams, error) {
+	fileID := extractSlackFileID(request.GetString("file_id", ""))
+	if fileID == "" {
+		return nil, errors.New("file_id is required")
+	}
+	return &canvasReadParams{fileID: fileID}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolListsItems(request mcp.CallToolRequest) (*listsItemsParams, error) {
+	listID := extractSlackFileID(request.GetString("list_id", ""))
+	if listID == "" {
+		return nil, errors.New("list_id is required (the F... id from the List URL)")
+	}
+	limit := request.GetInt("limit", 100)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	return &listsItemsParams{
+		listID: listID,
+		limit:  limit,
+		cursor: request.GetString("cursor", ""),
+	}, nil
+}
+
+func requiredWriteToolConfig(envVar, toolName string) (string, error) {
+	config := strings.TrimSpace(os.Getenv(envVar))
+	if config == "" {
+		return "", fmt.Errorf("%s is disabled; set %s to true, 1, or a comma-separated channel list", toolName, envVar)
+	}
+	return config, nil
+}
+
+func parseBlocksArg(request mcp.CallToolRequest) ([]slack.Block, error) {
+	args := request.GetArguments()
+	rawBlocks, ok := args["blocks"]
+	if !ok || rawBlocks == nil {
+		return nil, nil
+	}
+	var blocksJSON []byte
+	switch v := rawBlocks.(type) {
+	case string:
+		if v == "" {
+			return nil, nil
+		}
+		blocksJSON = []byte(v)
+	default:
+		var err error
+		blocksJSON, err = json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("blocks must be valid Slack Block Kit JSON: %w", err)
+		}
+	}
+	var slackBlocks slack.Blocks
+	if err := json.Unmarshal(blocksJSON, &slackBlocks); err != nil {
+		return nil, fmt.Errorf("blocks must be valid Slack Block Kit JSON: %w", err)
+	}
+	return slackBlocks.BlockSet, nil
+}
+
+func extractSlackFileID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`(?i)\bF[A-Z0-9]{5,}\b`)
+	if id := re.FindString(raw); id != "" {
+		return strings.ToUpper(id)
+	}
+	return raw
+}
+
+func buildMessageOptions(msgText, contentType string, blocks []slack.Block) ([]slack.MsgOption, error) {
+	if blocks != nil {
+		options := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
+		if msgText != "" {
+			options = append(options, slack.MsgOptionText(msgText, false))
+		}
+		return options, nil
+	}
+	if msgText == "" {
+		return nil, errors.New("either text or blocks must be provided")
+	}
+	switch contentType {
+	case "text/plain":
+		return []slack.MsgOption{slack.MsgOptionDisableMarkdown(), slack.MsgOptionText(msgText, false)}, nil
+	case "text/markdown":
+		blocks, err := slackGoUtil.ConvertMarkdownTextToBlocks(msgText)
+		if err != nil {
+			return []slack.MsgOption{slack.MsgOptionDisableMarkdown(), slack.MsgOptionText(msgText, false)}, nil
+		}
+		return []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}, nil
+	default:
+		return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
+	}
+}
+
 func (ch *ConversationsHandler) parseParamsToolUnreads(request mcp.CallToolRequest) *unreadsParams {
 	return &unreadsParams{
 		includeMessages:       request.GetBool("include_messages", true),
@@ -2390,6 +3206,13 @@ func (ch *ConversationsHandler) parseParamsToolSearch(ctx context.Context, req m
 		for key, val := range dateMap {
 			addFilter(filters, key, val)
 		}
+		if tz := strings.TrimSpace(req.GetString("filter_date_timezone", "")); tz != "" {
+			loc, err := time.LoadLocation(tz)
+			if err != nil {
+				return nil, fmt.Errorf("invalid filter_date_timezone %q: %v", tz, err)
+			}
+			params.dateLocation = loc
+		}
 		params.query = buildQuery(freeText, filters)
 	}
 
@@ -2495,6 +3318,14 @@ func (ch *ConversationsHandler) paramFormatChannel(raw string) (string, error) {
 
 func marshalMessagesToCSV(messages []Message) (*mcp.CallToolResult, error) {
 	csvBytes, err := gocsv.MarshalBytes(&messages)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(csvBytes)), nil
+}
+
+func marshalRowsToCSV[T any](rows []T) (*mcp.CallToolResult, error) {
+	csvBytes, err := gocsv.MarshalBytes(&rows)
 	if err != nil {
 		return nil, err
 	}
@@ -2786,7 +3617,7 @@ func filterMessagesByQuery(messages []Message, query string) []Message {
 // threadMessageMatches applies the parsed search query to a thread message.
 // Slack's search API cannot target a single thread, so these filters mirror the
 // search syntax locally.
-func threadMessageMatches(msg slack.Message, terms []string, filters map[string][]string) bool {
+func threadMessageMatches(msg slack.Message, terms []string, filters map[string][]string, loc *time.Location) bool {
 	body := msg.Text
 	if body == "" {
 		body = text.BlocksToText(msg.Blocks)
@@ -2805,13 +3636,18 @@ func threadMessageMatches(msg slack.Message, terms []string, filters map[string]
 		}
 	}
 
-	return slackMessageMatchesDateFilters(msg.Timestamp, filters)
+	return slackMessageMatchesDateFilters(msg.Timestamp, filters, loc)
 }
 
-func slackMessageMatchesDateFilters(ts string, filters map[string][]string) bool {
+func slackMessageMatchesDateFilters(ts string, filters map[string][]string, loc *time.Location) bool {
 	msgTime, ok := parseSlackTimestamp(ts)
 	if !ok {
 		return true
+	}
+	if loc != nil {
+		msgTime = msgTime.In(loc)
+	} else {
+		msgTime = msgTime.UTC()
 	}
 	msgDate := time.Date(msgTime.Year(), msgTime.Month(), msgTime.Day(), 0, 0, 0, 0, time.UTC)
 
